@@ -148,6 +148,7 @@ window_w_actual: s32 = WINDOW_W;
 window_h_actual: s32 = WINDOW_H;
 is_fullscreen: bool;
 saved_window_info: Saved_Window_Info;
+cam_mvp: Matrix4;
 
 col :: (r: float, g: float, b: float, a: float) -> Vector4 {
     return .{r, g, b, a};
@@ -246,87 +247,175 @@ draw_line :: (x1: float, y1: float, x2: float, y2: float, color: Vector4, thickn
     );
 }
 
-draw_wall :: (c: int, r: int) {
-    x := cast(float)(c * TILE);
-    y := cast(float)(r * TILE);
-    T := cast(float)TILE;
-    draw_filled_rect(x, y, T, T, col(0.243, 0.227, 0.306, 1));
-    draw_filled_rect(x + 1, y + 1, T/2 - 2, T/2 - 2, col(0.302, 0.282, 0.376, 1));
-    draw_filled_rect(x + T/2 + 1, y + 1, T/2 - 2, T/2 - 2, col(0.302, 0.282, 0.376, 1));
-    draw_filled_rect(x + T/4, y + T/2 + 1, T/2, T/2 - 2, col(0.302, 0.282, 0.376, 1));
-    draw_filled_rect(x + 1, y + 1, T/2 - 2, 1, col(0.404, 0.380, 0.502, 1));
-    draw_filled_rect(x + T/2 + 1, y + 1, T/2 - 2, 1, col(0.404, 0.380, 0.502, 1));
-    draw_filled_rect(x + T/4, y + T/2 + 1, T/2, 1, col(0.404, 0.380, 0.502, 1));
-    draw_filled_rect(x, y + T/2 - 1, T, 2, col(0.208, 0.192, 0.290, 1));
-    draw_filled_rect(x + T/2 - 1, y, 2, T, col(0.208, 0.192, 0.290, 1));
-    draw_filled_rect(x, y, T, 1, col(0.173, 0.157, 0.251, 1));
-    draw_filled_rect(x, y, 1, T, col(0.173, 0.157, 0.251, 1));
-    draw_filled_rect(x, y + T - 3, T, 3, col(0.082, 0.075, 0.137, 0.55));
-    draw_filled_rect(x + T - 3, y, 3, T, col(0.082, 0.075, 0.137, 0.45));
+make_view :: (eye: Vector3, target: Vector3, up: Vector3) -> Matrix4 {
+    f := target - eye;  normalize(*f, fallback=.{0,0,-1});
+    s := cross_product(f, up); normalize(*s, fallback=.{1,0,0});
+    u := cross_product(s, f);
+
+    m: Matrix4;
+    m._11 = s.x; m._12 = s.y; m._13 = s.z; m._14 = -dot_product(s, eye);
+    m._21 = u.x; m._22 = u.y; m._23 = u.z; m._24 = -dot_product(u, eye);
+    m._31 = -f.x; m._32 = -f.y; m._33 = -f.z; m._34 = dot_product(f, eye);
+    m._44 = 1;
+    return m;
 }
 
-draw_brick :: (c: int, r: int) {
-    x := cast(float)(c * TILE);
-    y := cast(float)(r * TILE);
-    T := cast(float)TILE;
-    draw_filled_rect(x, y, T, T, col(0.478, 0.361, 0.188, 1));
-    draw_filled_rect(x + 2, y + 2, T - 4, T - 6, col(0.545, 0.431, 0.243, 1));
-    draw_filled_rect(x + 2, y + T - 6, T - 4, 4, col(0.420, 0.306, 0.141, 1));
-    draw_filled_rect(x + 2, y + 2, T - 4, 1, col(0.722, 0.580, 0.376, 1));
-    draw_filled_rect(x + 2, y + 2, 1, T - 8, col(0.667, 0.529, 0.329, 1));
-    draw_stroke_rect(x + 3, y + 3, T - 6, T - 6, col(0.353, 0.239, 0.102, 1), 1);
-    draw_line(x + 4, y + T/2, x + T - 4, y + T/2, col(0.353, 0.239, 0.102, 1), 1);
-    draw_filled_rect(x + 5, y + 5, 6, 4, col(0.588, 0.471, 0.290, 1));
-    draw_filled_rect(x + T - 14, y + T/2 + 3, 6, 4, col(0.588, 0.471, 0.290, 1));
-    seed := c * 7 + r * 13;
-    draw_filled_rect(x + cast(float)((seed % 12) + 10), y + cast(float)(((seed * 3) % 8) + 14), 8, 3, col(0.369, 0.259, 0.118, 1));
-    draw_filled_rect(x, y + T - 3, T, 3, col(0.137, 0.094, 0.039, 0.55));
-    draw_filled_rect(x + T - 3, y, 3, T, col(0.137, 0.094, 0.039, 0.45));
+make_perspective :: (fov_y_rad: float, aspect: float, znear: float, zfar: float) -> Matrix4 {
+    f := 1.0 / tan(fov_y_rad * 0.5);
+    m: Matrix4;
+    m._11 = f / aspect;
+    m._22 = f;
+    m._33 = (zfar + znear) / (znear - zfar);
+    m._34 = (2.0 * zfar * znear) / (znear - zfar);
+    m._43 = -1;
+    return m;
 }
 
-draw_melting_brick :: (c: int, r: int, m: MeltingBrick) {
-    x := cast(float)(c * TILE);
-    y := cast(float)(r * TILE);
-    T := cast(float)TILE;
-    pct := cast(float)m.timer / cast(float)MELT_DURATION;
-    shrink := (1 - pct) * 8;
-    wob_x := sin(cast(float)frame_count / 2 + cast(float)c * 3) * (1 - pct) * 4;
-    wob_y := cos(cast(float)frame_count / 3 + cast(float)r * 5) * (1 - pct) * 3;
-    alpha := 0.4 + pct * 0.6;
-    draw_filled_rect(x + shrink * 0.5 + wob_x, y + shrink * 0.5 + wob_y, T - shrink, T - shrink, col(0.486, 0.302, 1.0, alpha));
-    inner_shrink := shrink + 2;
-    draw_filled_rect(x + inner_shrink * 0.5 + wob_x, y + inner_shrink * 0.5 + wob_y, T - inner_shrink, T - inner_shrink, col(0.545, 0.431, 0.243, alpha));
-    draw_filled_rect(x + wob_x, y + wob_y, T, T, col(0.486, 0.302, 1.0, (1 - pct) * 0.6));
+build_camera :: () {
+    board_cx := cast(float) (COLS * TILE) * 0.5;
+    board_cz := cast(float) (ROWS * TILE) * 0.5;
+
+    eye    := Vector3.{ board_cx, 1700, board_cz + 260 };
+    target := Vector3.{ board_cx, 0, board_cz };
+    up     := Vector3.{ 0, 1, 0 };
+
+    aspect := cast(float) WINDOW_W / cast(float) WINDOW_H;
+    proj := make_perspective(0.52, aspect, 50, 5000);
+    view := make_view(eye, target, up);
+    cam_mvp = proj * view;
 }
 
-draw_floor :: (c: int, r: int) {
-    x := cast(float)(c * TILE);
-    y := cast(float)(r * TILE);
-    T := cast(float)TILE;
+project :: (p: Vector3) -> Vector2, bool {
+    v := cam_mvp * Vector4.{p.x, p.y, p.z, 1};
+    if v.w <= 0.0001 return .{0, 0}, false;
+    inv_w := 1.0 / v.w;
+    sx := (v.x * inv_w + 1.0) * 0.5 * cast(float) WINDOW_W;
+    sy := (1.0 - v.y * inv_w) * 0.5 * cast(float) WINDOW_H;
+    return .{sx, sy}, true;
+}
+
+draw_tri_3d :: (a: Vector3, b: Vector3, c: Vector3, color: Vector4) {
+    pa, oa := project(a);
+    pb, ob := project(b);
+    pc, oc := project(c);
+    if !oa || !ob || !oc return;
+    Simp.immediate_triangle(Vector3.{pa.x, pa.y, 0}, Vector3.{pb.x, pb.y, 0}, Vector3.{pc.x, pc.y, 0}, color, color, color);
+}
+
+draw_quad_3d :: (a: Vector3, b: Vector3, c: Vector3, d: Vector3, color: Vector4) {
+    pa, oa := project(a);
+    pb, ob := project(b);
+    pc, oc := project(c);
+    pd, od := project(d);
+    if !oa || !ob || !oc || !od return;
+    Simp.immediate_quad(pa, pb, pc, pd, color);
+}
+
+shade :: (c: Vector4, mul: float) -> Vector4 {
+    return .{c.x * mul, c.y * mul, c.z * mul, c.w};
+}
+
+draw_cube_3d :: (cx: float, cz: float, half_w: float, height: float, top_c: Vector4, side_c: Vector4) {
+    x0 := cx - half_w; x1 := cx + half_w;
+    z0 := cz - half_w; z1 := cz + half_w;
+    y0 := 0.0;         y1 := height;
+
+    top_color   := shade(top_c, 1.0);
+    front_color := shade(side_c, 0.85);
+    left_color  := shade(side_c, 0.95);
+    right_color := shade(side_c, 0.62);
+
+    draw_quad_3d(.{x0, y1, z1}, .{x1, y1, z1}, .{x1, y1, z0}, .{x0, y1, z0}, top_color);
+    draw_quad_3d(.{x0, y0, z1}, .{x1, y0, z1}, .{x1, y1, z1}, .{x0, y1, z1}, front_color);
+    draw_quad_3d(.{x0, y0, z0}, .{x0, y0, z1}, .{x0, y1, z1}, .{x0, y1, z0}, left_color);
+    draw_quad_3d(.{x1, y0, z1}, .{x1, y0, z0}, .{x1, y1, z0}, .{x1, y1, z1}, right_color);
+}
+
+screen_scale_at :: (world: Vector3) -> float {
+    a, _ := project(world);
+    b, _ := project(.{world.x, world.y + cast(float)TILE, world.z});
+    return abs(a.y - b.y) / cast(float) TILE;
+}
+
+draw_floor_3d :: (c: int, r: int) {
+    x0 := cast(float)(c * TILE);
+    x1 := x0 + cast(float)TILE;
+    z0 := cast(float)(r * TILE);
+    z1 := z0 + cast(float)TILE;
+
+    base: Vector4;
+    accent: Vector4;
     if (r + c) % 2 == 0 {
-        draw_filled_rect(x, y, T, T, col(0.165, 0.153, 0.251, 1));
-        draw_filled_rect(x + 1, y + 1, T - 2, T - 2, col(0.145, 0.133, 0.220, 1));
+        base   = col(0.165, 0.153, 0.251, 1);
+        accent = col(0.145, 0.133, 0.220, 1);
     } else {
-        draw_filled_rect(x, y, T, T, col(0.188, 0.176, 0.282, 1));
-        draw_filled_rect(x + 1, y + 1, T - 2, T - 2, col(0.169, 0.157, 0.267, 1));
+        base   = col(0.188, 0.176, 0.282, 1);
+        accent = col(0.169, 0.157, 0.267, 1);
     }
+    draw_quad_3d(.{x0, 0, z0}, .{x1, 0, z0}, .{x1, 0, z1}, .{x0, 0, z1}, base);
+    inset := 2.0;
+    draw_quad_3d(.{x0 + inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z1 - inset}, .{x0 + inset, 0.1, z1 - inset}, accent);
+
     seed := c * 131 + r * 977;
-    sx := x + cast(float)(seed % 40) + 6;
-    sy := y + cast(float)((seed / 7) % 40) + 6;
-    draw_filled_circle(sx, sy, 1.2, col(0.302, 0.282, 0.451, 0.55), 6);
     if (seed % 5) == 0 {
         twinkle := 0.4 + (sin(cast(float)frame_count / 30.0 + cast(float)seed) + 1) * 0.25;
-        draw_filled_circle(sx + 12, sy + 8, 0.8, col(0.612, 0.502, 0.871, twinkle), 6);
+        offset_x := cast(float)(seed % 30) - 15;
+        offset_z := cast(float)((seed / 7) % 30) - 15;
+        cx_w := x0 + cast(float)TILE * 0.5 + offset_x;
+        cz_w := z0 + cast(float)TILE * 0.5 + offset_z;
+        sc, _ := project(.{cx_w, 0.2, cz_w});
+        draw_filled_circle(sc.x, sc.y, 1.2, col(0.612, 0.502, 0.871, twinkle), 6);
     }
 }
 
-draw_player_char :: () {
-    px := player.rx * cast(float)TILE;
-    py := player.ry * cast(float)TILE;
-    cx := px + cast(float)TILE / 2;
-    cy := py + cast(float)TILE / 2;
-    d := player.dir;
+draw_wall_3d :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    base := col(0.302, 0.282, 0.376, 1);
+    top  := col(0.404, 0.380, 0.502, 1);
+    draw_cube_3d(cx_w, cz_w, cast(float)TILE * 0.5, cast(float)TILE, top, base);
 
+    edge_dark := col(0.173, 0.157, 0.251, 1);
+    x0 := cx_w - cast(float)TILE * 0.5;
+    x1 := cx_w + cast(float)TILE * 0.5;
+    z0 := cz_w - cast(float)TILE * 0.5;
+    z1 := cz_w + cast(float)TILE * 0.5;
+    h  := cast(float)TILE;
+    tr := 1.5;
+    draw_quad_3d(.{x0, h, z1}, .{x1, h, z1}, .{x1, h - tr, z1}, .{x0, h - tr, z1}, shade(edge_dark, 1));
+    draw_quad_3d(.{x0, h, z0}, .{x0, h, z1}, .{x0, h - tr, z1}, .{x0, h - tr, z0}, shade(edge_dark, 1));
+}
+
+draw_brick_3d :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    h := cast(float)TILE * 0.72;
+    base := col(0.545, 0.431, 0.243, 1);
+    top  := col(0.667, 0.549, 0.341, 1);
+    draw_cube_3d(cx_w, cz_w, cast(float)TILE * 0.45, h, top, base);
+
+    seed := c * 7 + r * 13;
+    offset := cast(float)((seed % 18) - 8);
+    x0 := cx_w - 14 + offset;
+    z_face := cz_w + cast(float)TILE * 0.45 + 0.5;
+    draw_quad_3d(.{x0, h * 0.4, z_face}, .{x0 + 10, h * 0.4, z_face}, .{x0 + 10, h * 0.4 + 4, z_face}, .{x0, h * 0.4 + 4, z_face}, col(0.353, 0.239, 0.102, 0.85));
+}
+
+draw_melting_brick_3d :: (m: MeltingBrick) {
+    cx_w := cast(float)(m.x * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(m.y * TILE) + cast(float)TILE * 0.5;
+    pct := cast(float)m.timer / cast(float)MELT_DURATION;
+    height := cast(float)TILE * 0.72 * pct;
+    if height < 1 return;
+    alpha := 0.4 + pct * 0.6;
+    base := col(0.486, 0.302, 1.0, alpha);
+    topc := col(0.702, 0.533, 1.0, alpha);
+    half := cast(float)TILE * 0.45 * (0.7 + pct * 0.3);
+    draw_cube_3d(cx_w, cz_w, half, height, topc, base);
+}
+
+draw_player_char :: (cx: float, cy: float) {
+    d := player.dir;
     bob := sin(cast(float)frame_count / 12.0) * 0.6;
     cyb := cy + bob;
 
@@ -407,14 +496,9 @@ draw_player_char :: () {
     }
 }
 
-draw_enemy_char :: (e: *Enemy) {
+draw_enemy_char :: (e: *Enemy, cx: float, cy: float) {
     if !e.alive return;
-    px := e.rx * cast(float)TILE;
-    py := e.ry * cast(float)TILE;
-    cx := px + cast(float)TILE / 2;
-    cy := py + cast(float)TILE / 2;
     d := e.dir;
-
     bob := sin(cast(float)frame_count / 11.0 + cast(float)e.id) * 0.5;
     cyb := cy + bob;
 
@@ -508,9 +592,7 @@ draw_enemy_char :: (e: *Enemy) {
     }
 }
 
-draw_bomb :: (b: Bomb) {
-    bx := cast(float)(b.x * TILE) + cast(float)TILE / 2;
-    by := cast(float)(b.y * TILE) + cast(float)TILE / 2;
+draw_bomb :: (b: Bomb, bx: float, by: float) {
     pct_left := cast(float)b.timer / cast(float)BOMB_TIMER;
     pulse := sin(cast(float)frame_count / 4.0) * (3 + (1 - pct_left) * 4);
     r := 11 + pulse;
@@ -525,9 +607,7 @@ draw_bomb :: (b: Bomb) {
     }
 }
 
-draw_explosion :: (e: Explosion) {
-    ex := cast(float)(e.x * TILE) + cast(float)TILE / 2;
-    ey := cast(float)(e.y * TILE) + cast(float)TILE / 2;
+draw_explosion :: (e: Explosion, ex: float, ey: float) {
     progress := 1 - cast(float)e.timer / cast(float)e.duration;
     alpha := min(1.0, cast(float)e.timer / cast(float)e.duration + 0.2);
     size := cast(float)TILE - 4 + sin(progress * PI) * 8;
@@ -552,12 +632,8 @@ draw_explosion :: (e: Explosion) {
     }
 }
 
-draw_powerup :: (p: Powerup) {
+draw_powerup :: (p: Powerup, cx: float, cy: float) {
     if p.delay > 0 return;
-    px := cast(float)(p.x * TILE);
-    py := cast(float)(p.y * TILE);
-    cx := px + cast(float)TILE / 2;
-    cy := py + cast(float)TILE / 2;
     pulse := sin(cast(float)frame_count / 15.0) * 2;
     bob := sin(cast(float)frame_count / 20.0) * 2;
 
@@ -585,11 +661,7 @@ draw_powerup :: (p: Powerup) {
     }
 }
 
-draw_melting_powerup :: (m: MeltingPowerup) {
-    px := cast(float)(m.x * TILE);
-    py := cast(float)(m.y * TILE);
-    cx := px + cast(float)TILE / 2;
-    cy := py + cast(float)TILE / 2;
+draw_melting_powerup :: (m: MeltingPowerup, cx: float, cy: float) {
     pct := cast(float)m.timer / cast(float)POWERUP_MELT_DURATION;
     shrink := (1 - pct) * 14;
     h := 16 - shrink;
@@ -1369,36 +1441,87 @@ apply_letterbox :: () {
     glViewport(cast(s32) ox, cast(s32) oy, cast(u32) vw, cast(u32) vh);
 }
 
+project_tile_center :: (cx: float, cy: float) -> float, float {
+    sc, _ := project(.{cx, 0, cy});
+    return sc.x, sc.y;
+}
+
 render :: () {
     apply_letterbox();
     Simp.set_shader_for_color(enable_blend=true);
     Simp.immediate_set_2d_projection(WINDOW_W, WINDOW_H);
-    draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H, col(0.086, 0.078, 0.165, 1));
+
+    build_camera();
+
+    draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H * 0.55, col(0.094, 0.078, 0.180, 1));
+    draw_filled_rect(0, cast(float)WINDOW_H * 0.55, cast(float)WINDOW_W, cast(float)WINDOW_H * 0.45, col(0.063, 0.055, 0.137, 1));
 
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
-            if grid[r][c] == .WALL draw_wall(c, r);
-            else if grid[r][c] == .BRICK draw_brick(c, r);
-            else if grid[r][c] == .BRICK_MELTING {
-                for melting_bricks {
-                    if it.x == c && it.y == r {
-                        draw_melting_brick(c, r, it);
-                        break;
-                    }
-                }
-            } else {
-                draw_floor(c, r);
+            if grid[r][c] != .WALL && grid[r][c] != .BRICK {
+                draw_floor_3d(c, r);
             }
         }
     }
 
-    for powerups draw_powerup(it);
-    for melting_powerups draw_melting_powerup(it);
-    for bombs draw_bomb(it);
-    for explosions_list draw_explosion(it);
+    for r: 0..ROWS-1 {
+        for c: 0..COLS-1 {
+            if grid[r][c] == .WALL draw_wall_3d(c, r);
+            else if grid[r][c] == .BRICK draw_brick_3d(c, r);
+            else if grid[r][c] == .BRICK_MELTING {
+                for melting_bricks {
+                    if it.x == c && it.y == r {
+                        draw_melting_brick_3d(it);
+                        break;
+                    }
+                }
+            }
+        }
 
-    draw_player_char();
-    for * enemies draw_enemy_char(it);
+        for powerups {
+            if it.delay > 0 || it.y != r continue;
+            cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+            cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.25, cz_w});
+            draw_powerup(it, sc.x, sc.y);
+        }
+        for melting_powerups {
+            if it.y != r continue;
+            cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+            cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.25, cz_w});
+            draw_melting_powerup(it, sc.x, sc.y);
+        }
+        for bombs {
+            if it.y != r continue;
+            cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+            cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.3, cz_w});
+            draw_bomb(it, sc.x, sc.y);
+        }
+
+        if player.y == r {
+            cx_w := player.rx * cast(float)TILE + cast(float)TILE * 0.5;
+            cz_w := player.ry * cast(float)TILE + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, 0, cz_w});
+            draw_player_char(sc.x, sc.y - 26);
+        }
+        for * en: enemies {
+            if !en.alive || en.y != r continue;
+            cx_w := en.rx * cast(float)TILE + cast(float)TILE * 0.5;
+            cz_w := en.ry * cast(float)TILE + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, 0, cz_w});
+            draw_enemy_char(en, sc.x, sc.y - 28);
+        }
+
+        for explosions_list {
+            if it.y != r continue;
+            cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+            cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.35, cz_w});
+            draw_explosion(it, sc.x, sc.y);
+        }
+    }
 
     Simp.immediate_flush();
     Simp.set_shader_for_text();

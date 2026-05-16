@@ -1,13 +1,13 @@
 # Development Log
 
-## 2026-05-16 — JS prototype
+## 2026-05-17 — Initial build
 
-Built the full game in vanilla JS + Canvas: 17x17 grid, walls/bricks, WASD/arrows + Space/E bombs, BFS-driven enemy AI (3 warlocks), chain reactions, powerups (bomb, fire, kick, punch) with melt animations, smooth lerped movement, medieval/wizard theme.
+Wizard-themed Bomberman in `game.jai` using Simp for rendering and Window_Creation/Input. 15×13 grid, walls + bricks, BFS-driven enemy AI (3 warlocks), bomb chain reactions, powerups (bomb, fire, kick, punch) with melt animations, smooth lerped movement.
 
-## 2026-05-17 — Jai port
+## 2026-05-17 — Fixes & visuals
 
-Translated `game.js` to `game.jai` using Simp for rendering and Window_Creation/Input. Same constants and logic; BFS uses temp-allocated queues, no closures.
+LEFT_HANDED render target so origin sits top-left; F11 fullscreen with a centered aspect-preserving viewport so resizing never stretches. Bigger, clearer characters — distinct silhouettes per enemy (horned demon / tall wizard / hooded necromancer) and a glowing-orb staff for the player. Walls and bricks got drop-shadow strips for depth; floor got subtle twinkles.
 
-## 2026-05-17 — Fixes
+## 2026-05-17 — 3D look
 
-Switched Simp render target to LEFT_HANDED so the player spawns visually at top-left and arrow keys move the right direction (Up was previously walking into the top wall because Y was flipped).
+Switched the scene to a software-projected 3D pipeline. Custom perspective + view matrices feed `project(Vector3) → screen Vector2`; walls and bricks render as shaded cubes via 2D triangles, characters/bombs/powerups stay as billboards at projected positions. Painter's algorithm row-by-row, no depth buffer. Camera pitch ~82° (near-zenithal) so layout is easy to read and nothing important hides behind a brick.

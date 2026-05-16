@@ -1,0 +1,4 @@
+# Build artefacts
+game.exe
+game.pdb
+.build/
