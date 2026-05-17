@@ -1,5 +1,13 @@
 # Development Log
 
+## Audio + level polish pass
+
+Wired `Sound_Player` with three SFX (explosion / hitHurt / powerUp). `play_sfx(data, volume)` helper short-circuits when `audio_ready` is false so missing audio never crashes the game. Triggers: bomb origin only (`!b.chain`) at vol 0.10 — chained blasts share one boom; any player/enemy death at 0.55; player powerup pickup at 0.70. Patched a bug in `C:\Users\finxo\jai\modules\Sound_Player\os\win32.jai` where the win32 DSound backend hard-coded the 5.1 channel mask even for 8-channel systems, so init failed silently on 7.1 speaker configs — added an `else if num_channels == 8 { channel_mask = KSAUDIO_SPEAKER_7POINT1_SURROUND; }` branch.
+
+Level 3 (Snow): bumped spawn cadence (12–22 s between snowballs, 6 s first-spawn grace, 4 s forming) and added a new `LevelMechanic.tile_blocked` hook so idle/forming snowballs occupy their tile for both player + AI — rolling snowballs still pass through and kill. Level 4 (Pirate): swapped random spawn for a fixed-position layout — 4 cannons (2 left facing RIGHT, 2 right facing LEFT) controlled by the single `CANNON_EDGE_OFFSET` knob. `add_cannon` clears the cannon tile, back tile, and front tile so the trigger + fire path is always clean.
+
+Walls got per-theme renderers (`Theme.wall_renderer` proc field; `draw_wall_3d` delegates). Vanilla stays the boring stone block on purpose; the other four now have unique top-of-block ornaments drawn as billboards: volcanic = pulsing magma vein + lava drip + floating ember; snow = a snowman head bobbing on top (coal eyes, carrot nose, smile dots); pirate = brown rope coil + flag-on-pole (red or skull, picked by tile seed); beach = seed-picked starfish / paired seashells / palm frond fan. `wall_top_screen` helper projects the wall's top-face center to 2D so each renderer can scatter screen-space decorations without re-projecting.
+
 ## Foundation — game in Jai
 
 Wizard-themed Bomberman in `game.jai` using Simp + Window_Creation + Input. 15×13 grid, walls + bricks, smooth lerped movement, BFS-driven enemy AI (3 warlocks), bomb chain reactions, powerups (bomb / fire / kick / punch) with melt animations.
@@ -41,6 +49,18 @@ Pulled shake into a single master knob `SHAKE_INTENSITY` (0 disables, 0.5 defaul
 ## AI stops vaporising loot
 
 Targets are now typed (`TargetKind.ENTITY` vs `.POWERUP`); the chaser only drops a bomb when finishing an entity. `enemy_try_place_bomb` refuses any bomb whose blast (computed via the new `bomb_hits_tile` helper) would hit an unclaimed powerup — this also blocks opportunistic brick-busting that would have cratered nearby pickups. Powerup interest bumped from -4 → POWERUP_INTEREST (=7) Manhattan-tile head start so enemies divert to collect loot more eagerly.
+
+## Levels 3 / 4 / 5 — snow, pirate, beach
+
+Three levels live on top of the LevelMechanic table — no edits to the main update or render path. `Player.locked_by_mechanic` generalizes the cart's "the mechanic owns the player" gate so any mechanic (cart, fish) can claim it. New `LevelMechanic` hooks: `draw_overlay` (screen overlay), `on_explosion(bx, by, range)`, `on_player_moved`. New `Tile.WATER` (blocked, beach-only render).
+
+**Level 3 (SNOW).** Cool palette, packed-ice walls, snow-drift bricks, falling snowflake overlay. `Snowball`s spawn every 4–9 s on random empty tiles, take 3 s to form (pulsing while forming). A bomb explosion *orthogonally adjacent* to a formed snowball pushes it away (perpendicular to the bomb), and it rolls tile-by-tile, squishing any non-airborne entity it enters. Snowballs ignore walls/bricks and pass over both; they fall off the world at the border.
+
+**Level 4 (PIRATE).** Dark ship deck, hull walls, crate bricks. Up to 2 `Cannon`s spawn at random tiles facing a direction that has ≥2 open tiles ahead. A bomb whose blast hits a cannon's *back* tile lights the fuse (~1.5 s); on expiry, the cannon spawns a line of explosion tiles up to `CANNON_RANGE=5` in the firing direction (stops at walls/bricks/water like a normal blast). Fired cannons disappear.
+
+**Level 5 (BEACH).** Wooden boardwalk over animated water. `setup_beach` converts a sparse handful of empty interior tiles into `.WATER` (blocked) and places 3 fish on the remaining empty tiles. Stepping onto a fish triggers a 3-phase teleport (sink → travel → emerge) — `on_player_moved` is the hook. Player is `locked_by_mechanic` during teleport; player render is suppressed mid-flight; `draw_beach_overlay` shows bubble bursts at src/dst.
+
+**Adding a level is still purely additive.** Recipe: append a `LevelKind`, write a `*_theme()` constructor, write a `*_mechanic()` constructor (any subset of setup/tick/draw_*/on_*), add cases to `theme_for`/`mechanic_for`, add a key binding.
 
 ## Cart polish — block-aligned rails, enemy riders, unlimited rides
 

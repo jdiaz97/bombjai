@@ -8,6 +8,8 @@ Input :: #import "Input";
 #import "GL";
 
 Simp :: #import "Simp";
+Sound :: #import "Sound_Player"(VERBOSE = false);
+Sound_Data :: Sound.Sound_Data;
 
 // All gameplay timings below are tick counts. The game runs vsync-locked at the
 // monitor refresh, intended for 60 Hz — so divide a *_FRAMES/*_DURATION value by
@@ -83,6 +85,9 @@ WINDOW_H :: ROWS * TILE;
 LevelKind :: enum u8 {
     VANILLA;    // Level 1 — wizard ruins. No level-mechanic, pure Bomberman.
     VOLCANIC;   // Level 2 — mine. Rock blocks + a ridable mine cart on rails.
+    SNOW;       // Level 3 — blizzard. Snowballs form, get punched by bombs, roll over everything, squish characters.
+    PIRATE;     // Level 4 — deck. Two cannons spawn; a bomb on the back-tile lights their fuse, then they fire a long fire line.
+    BEACH;      // Level 5 — boardwalk. Some tiles are exposed water (blocked); fish on EMPTY tiles swallow + teleport.
 }
 
 Theme :: struct {
@@ -142,10 +147,31 @@ Theme :: struct {
     mote_a: Vector4;
     mote_b: Vector4;
     mote_c: Vector4;
+
+    // Optional per-level renderers. Null → use the default stone wall +
+    // mortar brick. Themes that set these get a fully custom block silhouette.
+    wall_renderer:  #type (c: int, r: int);
+    brick_renderer: #type (c: int, r: int);
+}
+
+// LevelMechanic is the one place levels hook into the main loop. Add a new
+// level by writing its setup/tick/draw procs and a mechanic constructor that
+// fills the table; the main update + render call through these pointers so
+// inactive levels pay nothing per frame. Null fields = no hook for that slot.
+LevelMechanic :: struct {
+    setup:           #type ();           // once after init_grid on level load
+    tick:            #type ();           // every update tick
+    draw_ground:     #type ();           // between floor lights and walls
+    draw_row:        #type (r: int);     // inside the per-row painter loop
+    draw_overlay:    #type ();           // after the world, before HUD
+    on_explosion:    #type (bx: int, by: int, range: int);   // bomb just exploded
+    on_player_moved: #type ();           // player.x/y just changed via move_player
+    tile_blocked:    #type (x: int, y: int) -> bool;         // dynamic per-tile block (e.g. snowballs)
 }
 
 current_level: LevelKind;
 current_theme: Theme;
+current_mechanic: LevelMechanic;
 
 vanilla_theme :: () -> Theme {
     t: Theme;
@@ -258,12 +284,237 @@ volcanic_theme :: () -> Theme {
     t.mote_a = col(1.0,  0.55, 0.18, 1);   // ember orange
     t.mote_b = col(1.0,  0.80, 0.35, 1);   // hot yellow
     t.mote_c = col(0.55, 0.30, 0.20, 1);   // soot brown
+    t.wall_renderer = draw_wall_volcanic;
+    return t;
+}
+
+snow_theme :: () -> Theme {
+    t: Theme;
+    t.sky_top      = col(0.040, 0.080, 0.180, 1);
+    t.sky_high     = col(0.085, 0.135, 0.270, 1);
+    t.sky_mid      = col(0.180, 0.275, 0.460, 1);
+    t.sky_horizon  = col(0.560, 0.700, 0.880, 1);
+    t.sky_under    = col(0.220, 0.310, 0.500, 1);
+    t.sky_floor    = col(0.075, 0.115, 0.230, 1);
+
+    t.body_glow    = col(0.92, 0.96, 1.00, 1);  // pale winter sun
+    t.body_core    = col(1.00, 0.98, 0.94, 1);
+    t.body_hot     = col(0.88, 0.94, 1.00, 1);
+
+    t.horizon_band   = col(0.85, 0.92, 1.00, 1);
+    t.horizon_sliver = col(1.00, 1.00, 1.00, 1);
+
+    t.aurora_0a = col(0.55, 0.78, 1.00, 1);
+    t.aurora_0b = col(0.85, 0.95, 1.00, 1);
+    t.aurora_1a = col(0.75, 0.90, 1.00, 1);
+    t.aurora_1b = col(0.40, 0.55, 0.85, 1);
+    t.aurora_2a = col(0.92, 0.98, 1.00, 1);
+    t.aurora_2b = col(0.65, 0.80, 0.95, 1);
+
+    t.floor_a_base   = col(0.78, 0.84, 0.92, 1);
+    t.floor_a_accent = col(0.70, 0.78, 0.88, 1);
+    t.floor_b_base   = col(0.84, 0.90, 0.96, 1);
+    t.floor_b_accent = col(0.76, 0.82, 0.90, 1);
+    t.floor_ao       = col(0.18, 0.22, 0.32, 0.50);
+    t.floor_speck    = col(1.00, 1.00, 1.00, 1);
+
+    t.wall_base   = col(0.55, 0.66, 0.82, 1);  // packed ice
+    t.wall_top    = col(0.78, 0.88, 0.98, 1);
+    t.wall_edge   = col(0.34, 0.44, 0.62, 1);
+    t.wall_mortar = col(0.42, 0.55, 0.78, 1);
+    t.wall_rune   = col(0.70, 0.92, 1.00, 1);
+
+    t.brick_base  = col(0.86, 0.91, 0.96, 1);  // snow drift
+    t.brick_top   = col(0.95, 0.98, 1.00, 1);
+    t.brick_rim   = col(0.55, 0.65, 0.80, 1);
+    t.brick_inner = col(1.00, 1.00, 1.00, 1);
+    t.brick_grain = col(0.62, 0.72, 0.86, 1);
+    t.brick_face  = col(0.50, 0.62, 0.80, 0.85);
+
+    t.melt_base = col(0.78, 0.88, 1.00, 1);
+    t.melt_top  = col(1.00, 1.00, 1.00, 1);
+
+    t.boom_tint = col(0.85, 0.92, 1.00, 1);
+
+    t.mote_a = col(1.00, 1.00, 1.00, 1);
+    t.mote_b = col(0.78, 0.90, 1.00, 1);
+    t.mote_c = col(0.62, 0.78, 0.95, 1);
+    t.wall_renderer  = draw_wall_snow;
+    t.brick_renderer = draw_brick_snow;
+    return t;
+}
+
+pirate_theme :: () -> Theme {
+    t: Theme;
+    t.sky_top      = col(0.030, 0.055, 0.110, 1);
+    t.sky_high     = col(0.060, 0.095, 0.170, 1);
+    t.sky_mid      = col(0.180, 0.240, 0.340, 1);
+    t.sky_horizon  = col(0.480, 0.420, 0.300, 1);
+    t.sky_under    = col(0.140, 0.180, 0.260, 1);
+    t.sky_floor    = col(0.040, 0.060, 0.110, 1);
+
+    t.body_glow    = col(1.00, 0.85, 0.55, 1);
+    t.body_core    = col(1.00, 0.95, 0.78, 1);
+    t.body_hot     = col(1.00, 0.90, 0.65, 1);
+
+    t.horizon_band   = col(0.85, 0.60, 0.30, 1);
+    t.horizon_sliver = col(1.00, 0.85, 0.55, 1);
+
+    t.aurora_0a = col(0.60, 0.75, 0.85, 1);  // sea spray
+    t.aurora_0b = col(0.30, 0.45, 0.55, 1);
+    t.aurora_1a = col(0.45, 0.55, 0.65, 1);
+    t.aurora_1b = col(0.85, 0.75, 0.55, 1);
+    t.aurora_2a = col(0.75, 0.65, 0.45, 1);
+    t.aurora_2b = col(0.35, 0.40, 0.50, 1);
+
+    t.floor_a_base   = col(0.42, 0.28, 0.16, 1);  // wood deck
+    t.floor_a_accent = col(0.35, 0.22, 0.12, 1);
+    t.floor_b_base   = col(0.48, 0.32, 0.18, 1);
+    t.floor_b_accent = col(0.40, 0.26, 0.14, 1);
+    t.floor_ao       = col(0.05, 0.03, 0.02, 0.60);
+    t.floor_speck    = col(0.85, 0.65, 0.35, 1);
+
+    t.wall_base   = col(0.28, 0.18, 0.10, 1);  // ship hull
+    t.wall_top    = col(0.48, 0.32, 0.18, 1);
+    t.wall_edge   = col(0.14, 0.08, 0.04, 1);
+    t.wall_mortar = col(0.60, 0.42, 0.20, 1);  // brass bolts
+    t.wall_rune   = col(0.90, 0.70, 0.30, 1);
+
+    t.brick_base  = col(0.42, 0.28, 0.16, 1);  // crate
+    t.brick_top   = col(0.60, 0.42, 0.22, 1);
+    t.brick_rim   = col(0.22, 0.14, 0.08, 1);
+    t.brick_inner = col(0.72, 0.55, 0.30, 1);
+    t.brick_grain = col(0.30, 0.20, 0.10, 1);
+    t.brick_face  = col(0.25, 0.16, 0.08, 0.85);
+
+    t.melt_base = col(0.62, 0.42, 0.20, 1);
+    t.melt_top  = col(0.85, 0.62, 0.32, 1);
+
+    t.boom_tint = col(1.00, 0.55, 0.20, 1);
+
+    t.mote_a = col(0.85, 0.70, 0.45, 1);   // dust
+    t.mote_b = col(1.00, 0.85, 0.55, 1);   // lantern glow
+    t.mote_c = col(0.55, 0.60, 0.70, 1);   // sea spray
+    t.wall_renderer  = draw_wall_pirate;
+    t.brick_renderer = draw_brick_pirate;
+    return t;
+}
+
+beach_theme :: () -> Theme {
+    t: Theme;
+    t.sky_top      = col(0.050, 0.180, 0.380, 1);
+    t.sky_high     = col(0.140, 0.380, 0.620, 1);
+    t.sky_mid      = col(0.350, 0.620, 0.820, 1);
+    t.sky_horizon  = col(0.85, 0.75, 0.55, 1);   // warm sandy haze
+    t.sky_under    = col(0.260, 0.500, 0.680, 1);
+    t.sky_floor    = col(0.080, 0.220, 0.420, 1);
+
+    t.body_glow    = col(1.00, 0.95, 0.70, 1);
+    t.body_core    = col(1.00, 1.00, 0.90, 1);
+    t.body_hot     = col(1.00, 0.90, 0.60, 1);
+
+    t.horizon_band   = col(1.00, 0.78, 0.45, 1);
+    t.horizon_sliver = col(1.00, 0.95, 0.78, 1);
+
+    t.aurora_0a = col(0.60, 0.85, 1.00, 1);
+    t.aurora_0b = col(0.95, 0.80, 0.55, 1);
+    t.aurora_1a = col(0.85, 0.95, 1.00, 1);
+    t.aurora_1b = col(0.40, 0.65, 0.85, 1);
+    t.aurora_2a = col(1.00, 0.85, 0.55, 1);
+    t.aurora_2b = col(0.55, 0.75, 0.95, 1);
+
+    t.floor_a_base   = col(0.62, 0.42, 0.22, 1);  // wood plank
+    t.floor_a_accent = col(0.52, 0.34, 0.16, 1);
+    t.floor_b_base   = col(0.68, 0.46, 0.24, 1);
+    t.floor_b_accent = col(0.58, 0.38, 0.18, 1);
+    t.floor_ao       = col(0.05, 0.03, 0.02, 0.55);
+    t.floor_speck    = col(0.95, 0.85, 0.60, 1);
+
+    t.wall_base   = col(0.42, 0.32, 0.22, 1);  // weathered post
+    t.wall_top    = col(0.62, 0.50, 0.36, 1);
+    t.wall_edge   = col(0.24, 0.18, 0.12, 1);
+    t.wall_mortar = col(0.80, 0.65, 0.40, 1);
+    t.wall_rune   = col(1.00, 0.92, 0.65, 1);
+
+    t.brick_base  = col(0.55, 0.40, 0.24, 1);  // driftwood
+    t.brick_top   = col(0.75, 0.58, 0.36, 1);
+    t.brick_rim   = col(0.32, 0.22, 0.12, 1);
+    t.brick_inner = col(0.85, 0.68, 0.42, 1);
+    t.brick_grain = col(0.40, 0.28, 0.16, 1);
+    t.brick_face  = col(0.30, 0.20, 0.10, 0.85);
+
+    t.melt_base = col(0.85, 0.65, 0.35, 1);
+    t.melt_top  = col(1.00, 0.85, 0.55, 1);
+
+    t.boom_tint = col(1.00, 0.80, 0.50, 1);
+
+    t.mote_a = col(1.00, 0.92, 0.68, 1);
+    t.mote_b = col(0.55, 0.85, 1.00, 1);
+    t.mote_c = col(1.00, 0.78, 0.45, 1);
+    t.wall_renderer  = draw_wall_beach;
+    t.brick_renderer = draw_brick_beach;
     return t;
 }
 
 theme_for :: (kind: LevelKind) -> Theme {
     if kind == .VOLCANIC return volcanic_theme();
+    if kind == .SNOW     return snow_theme();
+    if kind == .PIRATE   return pirate_theme();
+    if kind == .BEACH    return beach_theme();
     return vanilla_theme();
+}
+
+// Mechanic constructors. Each one returns the dispatch table for that level.
+// Vanilla has no mechanic — all-null table, so dispatch sites become noops.
+vanilla_mechanic :: () -> LevelMechanic {
+    return .{};
+}
+
+volcanic_mechanic :: () -> LevelMechanic {
+    m: LevelMechanic;
+    m.setup       = setup_mine_cart;
+    m.tick        = update_mine_cart;
+    m.draw_ground = draw_mine_cart_rails;
+    m.draw_row    = draw_mine_cart_row;
+    return m;
+}
+
+snow_mechanic :: () -> LevelMechanic {
+    m: LevelMechanic;
+    m.setup        = setup_snow;
+    m.tick         = tick_snow;
+    m.draw_row     = draw_snowballs_row;
+    m.draw_overlay = draw_snow_overlay;
+    m.on_explosion = on_explosion_snow;
+    m.tile_blocked = snow_tile_blocked;
+    return m;
+}
+
+pirate_mechanic :: () -> LevelMechanic {
+    m: LevelMechanic;
+    m.setup        = setup_pirate;
+    m.tick         = tick_pirate;
+    m.draw_row     = draw_cannons_row;
+    m.on_explosion = on_explosion_pirate;
+    return m;
+}
+
+beach_mechanic :: () -> LevelMechanic {
+    m: LevelMechanic;
+    m.setup           = setup_beach;
+    m.tick            = tick_beach;
+    m.draw_row        = draw_fishes_row;
+    m.draw_overlay    = draw_beach_overlay;
+    m.on_player_moved = on_player_moved_beach;
+    return m;
+}
+
+mechanic_for :: (kind: LevelKind) -> LevelMechanic {
+    if kind == .VOLCANIC return volcanic_mechanic();
+    if kind == .SNOW     return snow_mechanic();
+    if kind == .PIRATE   return pirate_mechanic();
+    if kind == .BEACH    return beach_mechanic();
+    return vanilla_mechanic();
 }
 
 Tile :: enum u8 {
@@ -271,6 +522,7 @@ Tile :: enum u8 {
     WALL;
     BRICK;
     BRICK_MELTING;
+    WATER;   // beach only — blocks movement + blast, rendered as exposed water
 }
 
 Dir :: enum u8 {
@@ -318,6 +570,11 @@ Player :: struct {
     hop_from_x, hop_from_y: float;
     hop_target_x, hop_target_y: float;
     hop_t: float;
+
+    // Generic "a mechanic owns me right now" flag. Any level mechanic that
+    // takes over the player (cart ride, fish swallow, etc) sets this and
+    // clears it on release. move/bomb/punch short-circuit on it.
+    locked_by_mechanic: bool;
 }
 
 Enemy :: struct {
@@ -423,16 +680,21 @@ PLAYER_HOP_HEIGHT      :: 42.0;  // peak height (pixels) of a player hop arc
 // MINE_CART_WAYPOINTS is the single source of truth for both the rail visuals
 // and the cart's mechanical path. Each entry is a grid (col, row). Adjacent
 // waypoints are connected as axis-aligned tile-by-tile segments (the cart
-// destroys bricks / kills enemies on every tile it enters). The LAST segment
-// is also rendered + traversed as a smooth Bezier curve so the cart finishes
-// with a clean curl and ejects the player perpendicular to the curve's exit
-// tangent (the "in front" direction at the end of the track).
+// destroys bricks / kills enemies on every tile it enters; powerups and
+// indestructible walls are left alone).
+//
+// DESIGN RULE: keep the route off the wall lattice. Walls sit at every (even
+// col, even row) tile, so:
+//   - horizontal segments → use an ODD row,
+//   - vertical segments   → use an ODD col,
+//   - waypoints themselves → never use (even, even).
+// Otherwise the cart will collide with an indestructible wall on the rails.
 MINE_CART_WAYPOINTS :: BFSNode.[
-    .{3,  2},   // start (top-left of the loop)
-    .{11, 2},   // run right along row 2
-    .{11, 10},  // drop down col 11
-    .{5,  10},  // run back left along row 10
-    .{3,  8},   // exit-ramp: cart curls up + slightly left, dismounts UP
+    .{3,  3},   // start
+    .{11, 3},   // run right along row 3 (odd, no walls)
+    .{11, 9},   // drop down col 11 (odd, no walls)
+    .{5,  9},   // run back left along row 9 (odd, no walls)
+    .{3,  7},   // exit-ramp: x-first then y → cart dismounts heading UP
 ];
 
 MineCartState :: enum u8 {
@@ -447,22 +709,100 @@ MineCartRider :: enum u8 {
 }
 
 MineCart :: struct {
-    active: bool;            // does the current level have a cart?
+    // `state == RIDING && rider == PLAYER` (or `.ENEMY`) is the canonical
+    // "cart is doing something" signal. load_level zeroes the whole struct
+    // when switching levels, so on non-volcanic levels every field stays in
+    // its default state and read-sites short-circuit naturally.
     state:  MineCartState;
     x, y:   int;             // current grid tile
     rx, ry: float;           // interpolated render position (tile space)
-    route_index: int;        // index into mine_cart_path (we advance toward route_index+1)
+    route_index: int;        // index into mine_cart_path
     move_timer: int;
     dx, dy: int;             // last direction of travel (faces the cart + sets dismount direction)
 
-    // Who is currently aboard. After the rider arc-hops off, the cart resets
-    // to IDLE at waypoint[0] so it can be ridden again — unlimited uses.
+    // Direction to advance route_index each tick. +1 forward (toward path end),
+    // -1 backward (toward path start). Set when a new rider mounts: the cart
+    // heads away from whichever endpoint it's currently parked at.
+    dir_sign: int;
+
+    // Who is currently aboard. The cart parks where the ride ends; the next
+    // rider sends it back the OPPOSITE direction. Unlimited rides.
     rider:           MineCartRider;
     rider_enemy_id:  int;    // valid when rider == ENEMY (index into enemies[])
 }
 
 mine_cart: MineCart;
 mine_cart_path: [..] BFSNode;    // expanded tile-by-tile path (for collisions/ticks)
+
+// ─── Level 3 (SNOW) — snowballs ─────────────────────────────────────────────
+SNOWBALL_FORM_TICKS  :: 240;    // 4 s to finish forming
+SNOWBALL_ROLL_DELAY  :: 5;
+SNOWBALL_MAX         :: 3;
+SNOWBALL_SPAWN_MIN   :: 720;    // 12 s between spawn attempts
+SNOWBALL_SPAWN_MAX   :: 1320;   // 22 s
+
+Snowball :: struct {
+    x, y: int;
+    rx, ry: float;
+    forming: bool;
+    form_timer: int;
+    rolling: bool;
+    roll_dx, roll_dy: int;
+    roll_timer: int;
+}
+snowballs: [..] Snowball;
+snowball_spawn_cooldown: int;
+
+SNOWFLAKE_COUNT :: 160;
+Snowflake :: struct {
+    sx, sy: float;
+    vy: float;
+    size: float;
+    sway: float;
+}
+snowflakes: [SNOWFLAKE_COUNT] Snowflake;
+snowflakes_initialized: bool;
+
+// ─── Level 4 (PIRATE) — cannons ─────────────────────────────────────────────
+// 4 fixed-position cannons: 2 on the left (face RIGHT), 2 on the right (face
+// LEFT). CANNON_EDGE_OFFSET is the *single* parameter that controls how far
+// from the side wall they sit. 1 = flush against the wall (back tile is the
+// border wall, unreachable); 2 = one tile in (back tile is interior, the
+// player can drop a bomb there). 2 is the recommended sweet spot.
+CANNON_FUSE_TICKS  :: 90;
+CANNON_RANGE       :: 5;
+CANNON_EDGE_OFFSET :: 2;     // columns from the side wall — 2 keeps back-tile reachable
+
+Cannon :: struct {
+    x, y: int;
+    dir: Dir;
+    fuse_timer: int;   // 0 = not lit; counts down once lit
+    fired: bool;
+}
+cannons: [..] Cannon;
+
+// ─── Level 5 (BEACH) — fish teleport ────────────────────────────────────────
+BEACH_WATER_DENSITY :: 0.08;
+BEACH_WATER_MAX     :: 12;
+BEACH_FISH_COUNT    :: 3;
+FISH_SWALLOW_TICKS  :: 18;
+FISH_TRAVEL_TICKS   :: 8;
+FISH_EJECT_TICKS    :: 18;
+FISH_TOTAL_TICKS    :: FISH_SWALLOW_TICKS + FISH_TRAVEL_TICKS + FISH_EJECT_TICKS;
+
+Fish :: struct {
+    x, y: int;
+    bob_phase: float;
+}
+fishes: [..] Fish;
+
+FishTeleport :: struct {
+    active: bool;
+    phase: int;
+    src_x, src_y: int;
+    dst_x, dst_y: int;
+}
+fish_teleport: FishTeleport;
 
 DIRS :: int.[0, -1, 0, 1, -1, 0, 1, 0]; // pairs (dx, dy) flattened
 
@@ -499,6 +839,22 @@ window_h_actual: s32 = WINDOW_H;
 is_fullscreen: bool;
 saved_window_info: Saved_Window_Info;
 cam_mvp: Matrix4;
+
+// Sound effects. Loaded once in main(); fired through play_sfx() at the
+// trigger sites (explosion, entity death, powerup pickup).
+sound_explosion: Sound_Data;
+sound_hit:       Sound_Data;
+sound_powerup:   Sound_Data;
+audio_ready:     bool;
+
+play_sfx :: (data: *Sound_Data, volume: float = 0.7) {
+    if !audio_ready return;
+    if !data.loaded return;
+    stream := Sound.make_stream(data, .GENERAL_SFX);
+    if !stream return;
+    stream.user_volume_scale = volume;
+    Sound.start_playing(stream);
+}
 
 // ─── Atmosphere & juice state ────────────────────────────────────────────────
 // SHAKE_INTENSITY: master shake knob.
@@ -934,6 +1290,7 @@ draw_floor_3d :: (c: int, r: int) {
 }
 
 draw_wall_3d :: (c: int, r: int) {
+    if current_theme.wall_renderer { current_theme.wall_renderer(c, r); return; }
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
     base := current_theme.wall_base;
@@ -971,6 +1328,7 @@ draw_wall_3d :: (c: int, r: int) {
 }
 
 draw_brick_3d :: (c: int, r: int) {
+    if current_theme.brick_renderer { current_theme.brick_renderer(c, r); return; }
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
     h := cast(float)TILE * 0.72;
@@ -1006,6 +1364,397 @@ draw_brick_3d :: (c: int, r: int) {
     bx := cx_w - 14 + offset;
     z_face := cz_w + half + 0.5;
     draw_quad_3d(.{bx, h * 0.4, z_face}, .{bx + 10, h * 0.4, z_face}, .{bx + 10, h * 0.4 + 4, z_face}, .{bx, h * 0.4 + 4, z_face}, current_theme.brick_face);
+}
+
+// ── Custom per-theme wall/brick renderers ───────────────────────────────────
+// Each level installs its own block silhouette so the playfield feels distinct
+// instead of "same shape, different paint". Wired into Theme.wall_renderer /
+// Theme.brick_renderer; draw_wall_3d / draw_brick_3d delegate to them.
+//
+// LEVEL 1 (VANILLA) intentionally has NO custom renderer — it stays the boring
+// stone cube. Every other level pins a recognisable decoration on top.
+
+// Helper — project the world-space center of a wall's top face to 2D so we
+// can scatter top-of-wall ornaments (snowman heads, rope coils, etc).
+wall_top_screen :: (c: int, r: int, height_frac: float = 1.0) -> sx: float, sy: float, scale: float {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    y := cast(float)TILE * height_frac;
+    sc, _ := project(.{cx_w, y, cz_w});
+    s := screen_scale_at(.{cx_w, y, cz_w});
+    return sc.x, sc.y, s;
+}
+
+draw_wall_volcanic :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.5;
+    h    := cast(float)TILE;
+    // Obsidian-like dark rock.
+    base := col(0.18, 0.12, 0.10, 1);
+    top  := col(0.36, 0.24, 0.20, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Glowing magma vein running across the top face.
+    seed := c * 73 + r * 211;
+    pulse := 0.65 + 0.35 * sin(cast(float)frame_count / 8.0 + cast(float)seed * 0.04);
+    vein  := col(1.0, 0.45 * pulse + 0.30, 0.15 * pulse, 1);
+    // Horizontal-ish vein with slight offset.
+    voff := cast(float)((seed % 16) - 8);
+    draw_quad_3d(.{x0 + 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
+                 .{x1 - 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
+                 .{x1 - 6, h + 0.08, cz_w + 1.5 + voff * 0.2},
+                 .{x0 + 6, h + 0.08, cz_w + 1.5 + voff * 0.2}, vein);
+    // Bright hot core line on top of the vein.
+    core := col(1.0, 0.92, 0.70, pulse);
+    draw_quad_3d(.{x0 + 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                 .{x1 - 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                 .{x1 - 8, h + 0.14, cz_w + 0.4 + voff * 0.2},
+                 .{x0 + 8, h + 0.14, cz_w + 0.4 + voff * 0.2}, core);
+
+    // Lava drip from top edge of the front face.
+    drip_x := x0 + 10 + cast(float)((seed * 3) % 30);
+    drip_top  := col(1.0, 0.55, 0.18, 1);
+    drip_glow := col(1.0, 0.30, 0.10, 0.55);
+    drip_h := cast(float)TILE * (0.18 + 0.08 * sin(cast(float)frame_count / 7.0 + cast(float)seed * 0.1));
+    // Glow halo
+    draw_quad_3d(.{drip_x - 3, h - drip_h, z1 + 0.1}, .{drip_x + 5, h - drip_h, z1 + 0.1}, .{drip_x + 5, h, z1 + 0.1}, .{drip_x - 3, h, z1 + 0.1}, drip_glow);
+    // Drip body
+    draw_quad_3d(.{drip_x, h - drip_h, z1 + 0.15}, .{drip_x + 2, h - drip_h, z1 + 0.15}, .{drip_x + 2.5, h, z1 + 0.15}, .{drip_x - 0.5, h, z1 + 0.15}, drip_top);
+
+    // Floating ember above the wall (2D billboard).
+    sx, sy, s := wall_top_screen(c, r, 1.0);
+    ember_phase := cast(float)frame_count / 30.0 + cast(float)seed * 0.07;
+    ey_off := sin(ember_phase) * 6.0;
+    ex_off := cos(ember_phase * 0.7) * 5.0;
+    a := 0.65 + 0.35 * sin(ember_phase * 2.0);
+    draw_filled_circle(sx + ex_off, sy - 14 + ey_off, 4.0 * s, col(1.0, 0.45, 0.15, a * 0.55), 10);
+    draw_filled_circle(sx + ex_off, sy - 14 + ey_off, 2.2 * s, col(1.0, 0.85, 0.45, a),         8);
+}
+
+draw_wall_snow :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.5;
+    h_body := cast(float)TILE * 0.78;
+    base := col(0.42, 0.62, 0.86, 1);
+    top  := col(0.78, 0.92, 1.00, 1);
+    draw_cube_3d(cx_w, cz_w, half, h_body, top, base);
+
+    // Wider snow cap.
+    cap_h := h_body + cast(float)TILE * 0.10;
+    draw_cube_3d(cx_w, cz_w, half - 1.5, cap_h, col(1, 1, 1, 1), col(0.88, 0.95, 1.00, 1));
+
+    // Snowman head perched on top — a clear "cute thing".
+    seed := c * 73 + r * 137;
+    sx, sy, s := wall_top_screen(c, r, 1.0);
+    bob := sin(cast(float)frame_count / 22.0 + cast(float)seed * 0.05) * 1.2;
+    head_y := sy - 18 + bob;
+    head_r := 11.0 * s;
+    // Shadow under head
+    draw_filled_ellipse(sx, sy - 4, head_r * 1.2, head_r * 0.45, col(0.20, 0.30, 0.45, 0.45));
+    // Body
+    draw_filled_circle(sx, head_y + 6, head_r * 0.95, col(0.92, 0.97, 1.00, 1), 18);
+    // Head
+    draw_filled_circle(sx, head_y, head_r * 0.78, col(1.00, 1.00, 1.00, 1), 18);
+    // Coal eyes
+    draw_filled_circle(sx - head_r * 0.28, head_y - head_r * 0.10, head_r * 0.13, col(0.10, 0.10, 0.18, 1), 8);
+    draw_filled_circle(sx + head_r * 0.28, head_y - head_r * 0.10, head_r * 0.13, col(0.10, 0.10, 0.18, 1), 8);
+    // Carrot nose
+    nose_c := col(1.00, 0.55, 0.18, 1);
+    draw_triangle(sx, head_y + 1, sx + head_r * 0.85, head_y - 1, sx + 1, head_y + 4, nose_c);
+    // Tiny smile dots
+    draw_filled_circle(sx - head_r * 0.30, head_y + head_r * 0.30, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
+    draw_filled_circle(sx,                  head_y + head_r * 0.38, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
+    draw_filled_circle(sx + head_r * 0.30, head_y + head_r * 0.30, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
+
+    // Twinkles next to the snowman.
+    pulse := 0.4 + 0.6 * sin(cast(float)frame_count / 11.0 + cast(float)seed * 0.05);
+    draw_filled_circle(sx - head_r * 1.6, head_y - 4, 1.6 * pulse * s, col(1, 1, 1, pulse), 6);
+    draw_filled_circle(sx + head_r * 1.6, head_y + 2, 1.4 * pulse * s, col(1, 1, 1, pulse), 6);
+}
+
+draw_brick_snow :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    h := cast(float)TILE * 0.50;
+    half := cast(float)TILE * 0.40;
+    base := col(0.85, 0.92, 1.00, 1);
+    top  := col(1.00, 1.00, 1.00, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Pile a smaller rounded mound on top.
+    pile_h := h + cast(float)TILE * 0.18;
+    draw_cube_3d(cx_w, cz_w, half - 4.0, pile_h, col(1, 1, 1, 1), col(0.94, 0.97, 1.00, 1));
+
+    // Sparkles
+    seed := c * 41 + r * 19;
+    pulse := 0.5 + 0.5 * sin(cast(float)frame_count / 9.0 + cast(float)seed * 0.03);
+    for i: 0..2 {
+        sx := x0 + 6 + cast(float)((seed * (i + 1)) % 18);
+        sz := z0 + 6 + cast(float)((seed * 3 + i * 11) % 18);
+        a := pulse * (0.5 + cast(float)i * 0.2);
+        draw_quad_3d(.{sx, pile_h + 0.2, sz}, .{sx + 1.6, pile_h + 0.2, sz}, .{sx + 1.6, pile_h + 0.2, sz + 1.6}, .{sx, pile_h + 0.2, sz + 1.6}, col(1, 1, 1, a));
+    }
+}
+
+draw_wall_pirate :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.5;
+    h := cast(float)TILE;
+    base := col(0.24, 0.15, 0.09, 1);
+    top  := col(0.48, 0.32, 0.18, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z1 := cz_w + half;
+
+    // Vertical plank seams on the front face — quick "wood" tell.
+    seam := col(0.10, 0.05, 0.03, 1);
+    for i: 1..2 {
+        px := x0 + cast(float)TILE * cast(float) i / 3.0;
+        draw_quad_3d(.{px - 0.8, 0.05, z1 + 0.1}, .{px + 0.8, 0.05, z1 + 0.1}, .{px + 0.8, h - 0.05, z1 + 0.1}, .{px - 0.8, h - 0.05, z1 + 0.1}, seam);
+    }
+
+    seed := c * 41 + r * 73;
+    sx, sy, s := wall_top_screen(c, r, 1.0);
+
+    // Rope coil sitting on top — a brown annulus.
+    coil_outer := col(0.62, 0.40, 0.20, 1);
+    coil_mid   := col(0.78, 0.52, 0.26, 1);
+    coil_inner := col(0.32, 0.18, 0.08, 1);
+    coil_r     := 12.0 * s;
+    draw_filled_ellipse(sx, sy - 2, coil_r * 1.30, coil_r * 0.50, col(0, 0, 0, 0.35));
+    draw_filled_circle(sx, sy - 4, coil_r,        coil_outer, 18);
+    draw_filled_circle(sx, sy - 4, coil_r * 0.85, coil_mid,   18);
+    draw_filled_circle(sx, sy - 4, coil_r * 0.40, coil_inner, 14);
+    // Coil grain — couple of arcs.
+    for i: 0..6 {
+        ang := (cast(float)i / 7.0) * TAU + cast(float)frame_count * 0.005;
+        px := sx + cos(ang) * coil_r * 0.72;
+        py := sy - 4 + sin(ang) * coil_r * 0.72 * 0.55;
+        draw_filled_circle(px, py, 1.2 * s, coil_inner, 6);
+    }
+
+    // Little flag on a pole — sticks up over the rope.
+    flag_sway := sin(cast(float)frame_count / 18.0 + cast(float)seed * 0.07) * 1.5;
+    pole_top_y := sy - 38;
+    pole_bot_y := sy - 6;
+    draw_line(sx + 6, pole_bot_y, sx + 6, pole_top_y, col(0.30, 0.20, 0.10, 1), 1.6);
+    flag_c := ifx (seed % 2) == 0 then col(0.78, 0.10, 0.10, 1) else col(0.10, 0.10, 0.14, 1);
+    draw_triangle(sx + 6, pole_top_y,
+                  sx + 22 + flag_sway, pole_top_y + 4,
+                  sx + 6, pole_top_y + 10, flag_c);
+    // Skull dot on the flag for the dark version.
+    if (seed % 2) != 0 {
+        draw_filled_circle(sx + 13 + flag_sway * 0.5, pole_top_y + 5, 1.6 * s, col(0.95, 0.95, 0.90, 1), 6);
+    }
+
+    // Brass-glint accent
+    pulse := 0.5 + 0.5 * sin(cast(float)frame_count / 4.0);
+    draw_filled_circle(sx + 6, pole_top_y, 2.0 * pulse, col(1, 0.92, 0.65, pulse), 6);
+}
+
+draw_brick_pirate :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    h := cast(float)TILE * 0.70;
+    half := cast(float)TILE * 0.42;
+    base := col(0.50, 0.34, 0.20, 1);
+    top  := col(0.74, 0.54, 0.32, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Edge rim on the top face — picture-frame look.
+    rim := col(0.28, 0.18, 0.10, 1);
+    rim_w :: 2.6;
+    draw_quad_3d(.{x0, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z0 + rim_w}, .{x0, h + 0.05, z0 + rim_w}, rim);
+    draw_quad_3d(.{x0, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
+    draw_quad_3d(.{x0, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
+    draw_quad_3d(.{x1 - rim_w, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z1}, .{x1 - rim_w, h + 0.05, z1}, rim);
+
+    // X-cross on top to read as a crate.
+    cross := col(0.28, 0.18, 0.10, 1);
+    cross_w :: 3.0;
+    in_x0 := x0 + rim_w + 2;
+    in_x1 := x1 - rim_w - 2;
+    in_z0 := z0 + rim_w + 2;
+    in_z1 := z1 - rim_w - 2;
+    draw_quad_3d(.{in_x0, h + 0.10, in_z0}, .{in_x0 + cross_w, h + 0.10, in_z0}, .{in_x1, h + 0.10, in_z1}, .{in_x1 - cross_w, h + 0.10, in_z1}, cross);
+    draw_quad_3d(.{in_x1 - cross_w, h + 0.10, in_z0}, .{in_x1, h + 0.10, in_z0}, .{in_x0 + cross_w, h + 0.10, in_z1}, .{in_x0, h + 0.10, in_z1}, cross);
+
+    // Tag on the front face.
+    label_bg := col(0.86, 0.78, 0.52, 1);
+    label_edge := col(0.40, 0.30, 0.16, 1);
+    fy := h * 0.40;
+    seed := c * 7 + r * 11;
+    off := cast(float)((seed % 8) - 4);
+    draw_quad_3d(.{cx_w - 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy + 9, z1 + 0.1}, .{cx_w - 9 + off, fy + 9, z1 + 0.1}, label_edge);
+    draw_quad_3d(.{cx_w - 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy + 8, z1 + 0.15}, .{cx_w - 8 + off, fy + 8, z1 + 0.15}, label_bg);
+}
+
+draw_wall_beach :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.46;
+    h := cast(float)TILE * 0.92;
+    base := col(0.38, 0.30, 0.22, 1);
+    top  := col(0.60, 0.50, 0.38, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z1 := cz_w + half;
+
+    // Horizontal grain bands on the face.
+    grain := col(0.20, 0.14, 0.08, 1);
+    for i: 1..3 {
+        gy := h * cast(float)i / 4.0;
+        draw_quad_3d(.{x0 + 3, gy, z1 + 0.1}, .{x1 - 3, gy, z1 + 0.1}, .{x1 - 3, gy + 0.8, z1 + 0.1}, .{x0 + 3, gy + 0.8, z1 + 0.1}, grain);
+    }
+
+    seed := c * 23 + r * 41;
+    sx, sy, s := wall_top_screen(c, r, 0.92);
+    pick := seed % 3;
+
+    if pick == 0 {
+        // Starfish on top.
+        bob := sin(cast(float)frame_count / 20.0 + cast(float)seed * 0.07) * 1.0;
+        star_y := sy - 6 + bob;
+        body_c := col(1.00, 0.55, 0.28, 1);
+        body_l := col(1.00, 0.78, 0.50, 1);
+        body_d := col(0.65, 0.30, 0.12, 1);
+        arm_r := 11.0 * s;
+        for i: 0..4 {
+            ang := (cast(float)i / 5.0) * TAU - PI * 0.5 + cast(float)frame_count * 0.004;
+            ax := sx + cos(ang) * arm_r;
+            ay := star_y + sin(ang) * arm_r;
+            mx := sx + cos(ang) * arm_r * 0.45;
+            my := star_y + sin(ang) * arm_r * 0.45;
+            wx := -sin(ang) * 4.0 * s;
+            wy :=  cos(ang) * 4.0 * s;
+            // Arm outline
+            draw_triangle(mx - wx * 1.1, my - wy * 1.1, mx + wx * 1.1, my + wy * 1.1, ax, ay, body_d);
+            // Arm fill
+            draw_triangle(mx - wx, my - wy, mx + wx, my + wy, ax, ay, body_c);
+        }
+        draw_filled_circle(sx, star_y, 6 * s, body_d, 14);
+        draw_filled_circle(sx, star_y, 4.6 * s, body_c, 14);
+        // Speckles
+        for i: 0..3 {
+            ang := (cast(float)i / 4.0) * TAU + cast(float)seed;
+            sxp := sx + cos(ang) * 2.5 * s;
+            syp := star_y + sin(ang) * 2.5 * s;
+            draw_filled_circle(sxp, syp, 0.9 * s, body_l, 5);
+        }
+    } else if pick == 1 {
+        // Two seashells stacked.
+        sh1 := col(1.00, 0.92, 0.78, 1);
+        sh2 := col(0.96, 0.75, 0.58, 1);
+        sh_rim := col(0.65, 0.42, 0.28, 1);
+        // Bottom shell
+        cx1 := sx - 4 * s;
+        cy1 := sy - 4;
+        draw_filled_ellipse(cx1, cy1 + 1, 11 * s, 4 * s, col(0, 0, 0, 0.30));
+        draw_filled_ellipse(cx1, cy1, 10 * s, 6 * s, sh_rim);
+        draw_filled_ellipse(cx1, cy1, 9 * s, 5 * s, sh1);
+        // Ridges
+        for i: 0..3 {
+            rx := cx1 - 6 * s + cast(float)i * 4 * s;
+            draw_line(rx, cy1 - 4 * s, rx, cy1 + 4 * s, sh2, 0.9 * s);
+        }
+        // Top spiral shell
+        cx2 := sx + 6 * s;
+        cy2 := sy - 12;
+        draw_filled_circle(cx2, cy2 + 1, 7 * s, col(0, 0, 0, 0.30), 12);
+        draw_filled_circle(cx2, cy2, 7 * s, sh_rim, 14);
+        draw_filled_circle(cx2, cy2, 6 * s, sh1, 14);
+        for i: 0..2 {
+            ang := cast(float)i * 1.6 + cast(float)frame_count * 0.01;
+            rr := 4.5 * s - cast(float)i * 1.5 * s;
+            draw_filled_circle(cx2 + cos(ang) * rr * 0.4, cy2 + sin(ang) * rr * 0.4, 1.8 * s, sh2, 6);
+        }
+    } else {
+        // Palm frond fan.
+        sway := sin(cast(float)frame_count / 28.0 + cast(float)seed * 0.05) * 0.18;
+        stem_c := col(0.30, 0.22, 0.10, 1);
+        leaf_d := col(0.18, 0.45, 0.22, 1);
+        leaf_l := col(0.36, 0.78, 0.36, 1);
+        // Pot (coconut at base)
+        draw_filled_circle(sx, sy - 6, 6 * s, col(0.40, 0.25, 0.12, 1), 12);
+        draw_filled_circle(sx, sy - 6, 4.5 * s, col(0.22, 0.14, 0.08, 1), 12);
+        // Fronds — 5 of them fanning up.
+        leaf_len := 22 * s;
+        for i: 0..4 {
+            t := cast(float)(i - 2);
+            ang := -PI * 0.5 + t * 0.42 + sway;
+            tip_x := sx + cos(ang) * leaf_len;
+            tip_y := sy - 6 + sin(ang) * leaf_len;
+            mid_x := sx + cos(ang) * leaf_len * 0.55;
+            mid_y := sy - 6 + sin(ang) * leaf_len * 0.55;
+            wx := -sin(ang) * 4 * s;
+            wy :=  cos(ang) * 4 * s;
+            draw_triangle(mid_x - wx, mid_y - wy, mid_x + wx, mid_y + wy, tip_x, tip_y, leaf_d);
+            // Highlight
+            draw_line(sx, sy - 6, tip_x, tip_y, leaf_l, 1.2 * s);
+        }
+    }
+}
+
+draw_brick_beach :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    // Driftwood log lying flat.
+    h := cast(float)TILE * 0.45;
+    half := cast(float)TILE * 0.42;
+    base := col(0.50, 0.36, 0.22, 1);
+    top  := col(0.74, 0.58, 0.38, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Concentric growth rings on the top face (using progressively shrinking
+    // squares — keeps it block-aligned with the rest of the art).
+    ring1 := col(0.34, 0.22, 0.14, 1);
+    ring2 := col(0.60, 0.44, 0.28, 1);
+    ring3 := col(0.82, 0.66, 0.44, 1);
+    for i: 0..2 {
+        inset := 4.0 + cast(float) i * 4.0;
+        c_band := ifx (i % 2) == 0 then ring1 else ring2;
+        draw_quad_3d(.{x0 + inset, h + 0.05 + cast(float)i * 0.02, z0 + inset},
+                     .{x1 - inset, h + 0.05 + cast(float)i * 0.02, z0 + inset},
+                     .{x1 - inset, h + 0.05 + cast(float)i * 0.02, z1 - inset},
+                     .{x0 + inset, h + 0.05 + cast(float)i * 0.02, z1 - inset}, c_band);
+    }
+    draw_quad_3d(.{cx_w - 2, h + 0.12, cz_w - 2}, .{cx_w + 2, h + 0.12, cz_w - 2}, .{cx_w + 2, h + 0.12, cz_w + 2}, .{cx_w - 2, h + 0.12, cz_w + 2}, ring3);
+
+    // Knot on the front face.
+    knot_d := col(0.20, 0.12, 0.06, 1);
+    knot_l := col(0.40, 0.26, 0.14, 1);
+    seed := c * 11 + r * 29;
+    kx := cx_w - 6 + cast(float)((seed % 14) - 7);
+    ky := h * 0.4;
+    draw_quad_3d(.{kx - 3, ky - 1, z1 + 0.1}, .{kx + 3, ky - 1, z1 + 0.1}, .{kx + 3, ky + 7, z1 + 0.1}, .{kx - 3, ky + 7, z1 + 0.1}, knot_d);
+    draw_quad_3d(.{kx - 1.5, ky + 1, z1 + 0.15}, .{kx + 1.5, ky + 1, z1 + 0.15}, .{kx + 1.5, ky + 5, z1 + 0.15}, .{kx - 1.5, ky + 5, z1 + 0.15}, knot_l);
 }
 
 draw_background :: () {
@@ -2090,7 +2839,6 @@ tile_to_world_xz :: (tx: float, ty: float) -> x: float, z: float {
 // chain of tile-aligned straight sections (one per traversed tile). Corners
 // stay as the same crisp 90° L-bends as the other vertices.
 draw_mine_cart_rails :: () {
-    if !mine_cart.active return;
     n := MINE_CART_WAYPOINTS.count;
     if n < 2 return;
 
@@ -2130,6 +2878,17 @@ draw_mine_cart_rails :: () {
             draw_rail_section(axw, azw, bxw, bzw, draw_tie = true);
         }
     }
+}
+
+// Per-row painter hook — installed in volcanic_mechanic.draw_row. Renders the
+// cart on the row that matches its current tile so it stacks correctly with
+// the player, enemies, and bombs in that row.
+draw_mine_cart_row :: (r: int) {
+    if cast(int)(mine_cart.ry + 0.5) != r return;
+    cx_w := mine_cart.rx * cast(float)TILE + cast(float)TILE * 0.5;
+    cz_w := mine_cart.ry * cast(float)TILE + cast(float)TILE * 0.5;
+    sc, _ := project(.{cx_w, cast(float)TILE * 0.18, cz_w});
+    draw_mine_cart(sc.x, sc.y);
 }
 
 draw_mine_cart :: (cx: float, cy: float) {
@@ -2295,34 +3054,29 @@ expand_route :: (waypoints: [] BFSNode) -> [..] BFSNode {
     return out;
 }
 
-// Clear walls/bricks that sit on the cart's tracks so the rails are always
-// passable. Spawn tiles for player + enemies are kept (we won't bulldoze them).
+// Clear only the BRICK tiles that sit on the cart's tracks. Indestructible
+// walls (border ring + every even/even tile) are left in place — they define
+// the level's lattice and shouldn't be perforated by the rails. The route in
+// MINE_CART_WAYPOINTS must therefore be designed to never cross a wall tile
+// (use odd rows for horizontal segments and odd cols for vertical ones).
 clear_route_tiles :: (path: [] BFSNode) {
     for path {
         if it.x <= 0 || it.x >= COLS - 1 continue;
         if it.y <= 0 || it.y >= ROWS - 1 continue;
-        grid[it.y][it.x] = .EMPTY;
+        if grid[it.y][it.x] == .BRICK grid[it.y][it.x] = .EMPTY;
     }
 }
 
 setup_mine_cart :: () {
-    array_reset(*mine_cart_path);
-    mine_cart.active = false;
-    mine_cart.state = .IDLE;
-    mine_cart.dx = 0;
-    mine_cart.dy = 0;
-    mine_cart.move_timer = 0;
-    mine_cart.route_index = 0;
-    mine_cart.rider = .NONE;
+    // load_level has already zeroed mine_cart + mine_cart_path before this
+    // mechanic's setup runs, so we start from a clean slate.
+    mine_cart.dir_sign = 1;
     mine_cart.rider_enemy_id = -1;
-
-    if current_level != .VOLCANIC return;
 
     mine_cart_path = expand_route(MINE_CART_WAYPOINTS);
 
     clear_route_tiles(mine_cart_path);
 
-    mine_cart.active = true;
     mine_cart.x = mine_cart_path[0].x;
     mine_cart.y = mine_cart_path[0].y;
     mine_cart.rx = cast(float) mine_cart.x;
@@ -2361,6 +3115,7 @@ cart_hit_tile :: (tx: int, ty: int) {
             spawn_death_fx(en.rx, en.ry, en.glow, true);
             drop_enemy_powerups(en);
             add_shake(SHAKE_PER_CHAIN * 0.6);
+            play_sfx(*sound_hit, 0.55);
         }
     }
 
@@ -2373,14 +3128,26 @@ cart_hit_tile :: (tx: int, ty: int) {
             hit_flash_timer = 22;
             player_won = false;
             add_shake(SHAKE_PER_CHAIN * 0.7);
+            play_sfx(*sound_hit, 0.55);
         }
     }
 }
 
-// Mount the cart if any entity is standing on its start tile. Runs every
-// frame so both the player and roaming enemies can hop on.
+// Pick the direction to travel based on which endpoint the cart is parked at.
+// At path[0] → forward (+1). At path[last] → backward (-1). Anywhere in
+// between (rider died mid-route) → keep the existing sign.
+choose_cart_direction :: () {
+    if mine_cart.route_index == 0 {
+        mine_cart.dir_sign = 1;
+    } else if mine_cart.route_index == mine_cart_path.count - 1 {
+        mine_cart.dir_sign = -1;
+    }
+}
+
+// Mount the cart if any entity is standing on its current parked tile. Runs
+// every frame so both the player and roaming enemies can hop on. The cart
+// stays where it last stopped — the next rider sends it the opposite way.
 try_mount_cart :: () {
-    if !mine_cart.active return;
     if mine_cart.state != .IDLE return;
 
     // Player has priority — if both player and an enemy share the tile, the
@@ -2390,6 +3157,8 @@ try_mount_cart :: () {
         mine_cart.rider = .PLAYER;
         mine_cart.rider_enemy_id = -1;
         mine_cart.move_timer = CART_MOVE_DELAY;
+        player.locked_by_mechanic = true;
+        choose_cart_direction();
         spawn_fx(cast(float)mine_cart.x, cast(float)mine_cart.y, col(1.0, 0.85, 0.45, 1), .BOING);
         return;
     }
@@ -2402,6 +3171,7 @@ try_mount_cart :: () {
             mine_cart.rider = .ENEMY;
             mine_cart.rider_enemy_id = ei;
             mine_cart.move_timer = CART_MOVE_DELAY;
+            choose_cart_direction();
             spawn_fx(cast(float)mine_cart.x, cast(float)mine_cart.y, col(1.0, 0.85, 0.45, 1), .BOING);
             return;
         }
@@ -2440,24 +3210,13 @@ start_enemy_hop :: (en: *Enemy, dx: int, dy: int, src_x: float, src_y: float) {
     spawn_fx(src_x, src_y, en.glow, .BOING);
 }
 
-// Reset the cart back to its start tile so it can be ridden again. Called
-// after the rider arc-hop has been initiated.
-respawn_mine_cart :: () {
-    if mine_cart_path.count == 0 return;
+// Drop the rider, leave the cart parked at its current tile + facing. The
+// next rider mounts here and sends it in the opposite direction.
+park_mine_cart :: () {
     mine_cart.state = .IDLE;
     mine_cart.rider = .NONE;
     mine_cart.rider_enemy_id = -1;
-    mine_cart.route_index = 0;
     mine_cart.move_timer = 0;
-    mine_cart.x = mine_cart_path[0].x;
-    mine_cart.y = mine_cart_path[0].y;
-    mine_cart.rx = cast(float) mine_cart.x;
-    mine_cart.ry = cast(float) mine_cart.y;
-    if mine_cart_path.count > 1 {
-        mine_cart.dx = mine_cart_path[1].x - mine_cart_path[0].x;
-        mine_cart.dy = mine_cart_path[1].y - mine_cart_path[0].y;
-    }
-    spawn_fx(cast(float) mine_cart.x, cast(float) mine_cart.y, col(1.0, 0.85, 0.45, 1), .BOING);
 }
 
 eject_rider_from_cart :: () {
@@ -2471,13 +3230,14 @@ eject_rider_from_cart :: () {
     src_y := cast(float) mine_cart.y;
 
     if mine_cart.rider == .PLAYER {
+        player.locked_by_mechanic = false;
         start_player_hop(dx, dy, src_x, src_y);
     } else if mine_cart.rider == .ENEMY {
         en := *enemies[mine_cart.rider_enemy_id];
         if en.alive start_enemy_hop(en, dx, dy, src_x, src_y);
     }
 
-    respawn_mine_cart();
+    park_mine_cart();
 }
 
 // Shared chain-hop update for one airborne entity. Mirrors the punched-bomb
@@ -2547,8 +3307,6 @@ update_enemy_hops :: () {
 }
 
 update_mine_cart :: () {
-    if !mine_cart.active return;
-
     // Smooth render position toward the current tile center.
     mine_cart.rx += (cast(float)mine_cart.x - mine_cart.rx) * LERP_SPEED;
     mine_cart.ry += (cast(float)mine_cart.y - mine_cart.ry) * LERP_SPEED;
@@ -2572,8 +3330,9 @@ update_mine_cart :: () {
             en.rx = mine_cart.rx;
             en.ry = mine_cart.ry;
         } else {
-            // Rider died (e.g., bomb caught up). Drop them off without a hop.
-            respawn_mine_cart();
+            // Rider died (e.g., bomb caught up). Cart parks where it is; the
+            // next rider can mount and continue in the same direction.
+            park_mine_cart();
             return;
         }
     }
@@ -2582,8 +3341,8 @@ update_mine_cart :: () {
     if mine_cart.move_timer > 0 return;
     mine_cart.move_timer = CART_MOVE_DELAY;
 
-    next_idx := mine_cart.route_index + 1;
-    if next_idx >= mine_cart_path.count {
+    next_idx := mine_cart.route_index + mine_cart.dir_sign;
+    if next_idx < 0 || next_idx >= mine_cart_path.count {
         eject_rider_from_cart();
         return;
     }
@@ -2598,18 +3357,568 @@ update_mine_cart :: () {
     cart_hit_tile(mine_cart.x, mine_cart.y);
 }
 
+// Visual-only helper — used by the render pass to lift the player onto the
+// cart sprite. Movement/bomb gating uses `player.locked_by_mechanic` instead.
 player_is_riding :: () -> bool {
-    return mine_cart.active && mine_cart.state == .RIDING;
+    return mine_cart.state == .RIDING && mine_cart.rider == .PLAYER;
 }
 
 player_is_busy :: () -> bool {
-    // True when the player can't act (riding the cart, mid hop arc, or stunned).
-    return player_is_riding() || player.hopping || player.stun_timer > 0;
+    // True when the player can't act (mid hop arc, stunned, or owned by a
+    // level mechanic — cart ride, fish swallow, etc).
+    return player.locked_by_mechanic || player.hopping || player.stun_timer > 0;
+}
+
+// ─── Level 3 (SNOW) implementation ──────────────────────────────────────────
+
+setup_snow :: () {
+    array_reset(*snowballs);
+    snowball_spawn_cooldown = 360;   // 6 s grace before the first snowball
+    snowflakes_initialized = false;
+}
+
+// Idle/forming snowballs occupy their tile — blocks movement so the player
+// is forced to engage with them. Rolling snowballs don't block; they kill.
+snow_tile_blocked :: (x: int, y: int) -> bool {
+    for sb: snowballs {
+        if sb.rolling continue;
+        if sb.x == x && sb.y == y return true;
+    }
+    return false;
+}
+
+// Kill any non-airborne entity standing on (x, y). Used by snowballs when
+// rolling onto a tile.
+snowball_squish_at :: (x: int, y: int) {
+    if !player.hopping && game_over_delay == 0 && player.x == x && player.y == y {
+        spawn_death_fx(player.rx, player.ry, col(0.353, 0.604, 0.965, 1), true);
+        game_over_delay = 50;
+        hit_flash_timer = 22;
+        player_won = false;
+        add_shake(SHAKE_PER_CHAIN);
+        play_sfx(*sound_hit, 0.55);
+    }
+    for * en, ei: enemies {
+        if !en.alive continue;
+        if en.hopping continue;
+        if en.x == x && en.y == y {
+            en.alive = false;
+            spawn_death_fx(en.rx, en.ry, en.glow, true);
+            drop_enemy_powerups(en);
+            add_shake(SHAKE_PER_CHAIN * 0.6);
+            play_sfx(*sound_hit, 0.55);
+        }
+    }
+}
+
+spawn_snowball :: () {
+    // Pick a random interior EMPTY tile that's not on top of player/enemy/bomb
+    // and not too close to the player. A few attempts is enough on a sparse grid.
+    for attempts: 0..30 {
+        c := 1 + cast(int)(random_get() % cast(u64)(COLS - 2));
+        r := 1 + cast(int)(random_get() % cast(u64)(ROWS - 2));
+        if grid[r][c] != .EMPTY continue;
+        if abs(c - player.x) + abs(r - player.y) < 3 continue;
+        clash := false;
+        for sb: snowballs if sb.x == c && sb.y == r { clash = true; break; }
+        if clash continue;
+        for b: bombs if !b.punching && b.x == c && b.y == r { clash = true; break; }
+        if clash continue;
+        sb: Snowball;
+        sb.x = c; sb.y = r;
+        sb.rx = cast(float) c; sb.ry = cast(float) r;
+        sb.forming = true;
+        sb.form_timer = SNOWBALL_FORM_TICKS;
+        array_add(*snowballs, sb);
+        return;
+    }
+}
+
+tick_snow :: () {
+    // Try to spawn new snowballs over time.
+    if snowballs.count < SNOWBALL_MAX {
+        snowball_spawn_cooldown -= 1;
+        if snowball_spawn_cooldown <= 0 {
+            spawn_snowball();
+            range := SNOWBALL_SPAWN_MAX - SNOWBALL_SPAWN_MIN;
+            snowball_spawn_cooldown = SNOWBALL_SPAWN_MIN + cast(int)(random_get() % cast(u64) range);
+        }
+    }
+
+    // Tick / advance each snowball.
+    i := snowballs.count - 1;
+    while i >= 0 {
+        sb := *snowballs[i];
+        // Smooth render position toward grid tile.
+        sb.rx += (cast(float)sb.x - sb.rx) * LERP_SPEED;
+        sb.ry += (cast(float)sb.y - sb.ry) * LERP_SPEED;
+
+        if sb.forming {
+            sb.form_timer -= 1;
+            if sb.form_timer <= 0 sb.forming = false;
+        } else if sb.rolling {
+            sb.roll_timer -= 1;
+            if sb.roll_timer <= 0 {
+                sb.roll_timer = SNOWBALL_ROLL_DELAY;
+                nx := sb.x + sb.roll_dx;
+                ny := sb.y + sb.roll_dy;
+                // Roll off the playable interior → snowball falls off.
+                if nx < 1 || nx >= COLS - 1 || ny < 1 || ny >= ROWS - 1 {
+                    spawn_fx(cast(float)sb.x, cast(float)sb.y, col(0.95, 0.98, 1.0, 1), .BIG);
+                    array_unordered_remove_by_index(*snowballs, i);
+                    i -= 1;
+                    continue;
+                }
+                sb.x = nx;
+                sb.y = ny;
+                snowball_squish_at(nx, ny);
+                spawn_fx(cast(float)nx, cast(float)ny, col(0.95, 0.98, 1.0, 1), .DUST);
+            }
+        }
+        i -= 1;
+    }
+}
+
+on_explosion_snow :: (bx: int, by: int, range: int) {
+    // Push any fully-formed snowball that's orthogonally adjacent to the bomb
+    // center. Pushes away from the bomb. Forming snowballs are immune.
+    for * sb: snowballs {
+        if sb.forming continue;
+        if sb.rolling continue;
+        dx := sb.x - bx;
+        dy := sb.y - by;
+        push_dx := 0;
+        push_dy := 0;
+        if dx == 0 && abs(dy) == 1 {
+            push_dy = ifx dy > 0 then 1 else -1;
+        } else if dy == 0 && abs(dx) == 1 {
+            push_dx = ifx dx > 0 then 1 else -1;
+        } else {
+            continue;
+        }
+        sb.rolling = true;
+        sb.roll_dx = push_dx;
+        sb.roll_dy = push_dy;
+        sb.roll_timer = SNOWBALL_ROLL_DELAY;
+    }
+}
+
+draw_snowballs_row :: (r: int) {
+    for sb: snowballs {
+        if cast(int)(sb.ry + 0.5) != r continue;
+        cx_w := sb.rx * cast(float)TILE + cast(float)TILE * 0.5;
+        cz_w := sb.ry * cast(float)TILE + cast(float)TILE * 0.5;
+        form_frac: float = 1.0;
+        if sb.forming form_frac = 1.0 - cast(float)sb.form_timer / cast(float)SNOWBALL_FORM_TICKS;
+        radius := 8.0 + form_frac * 16.0;
+        sc, _ := project(.{cx_w, radius * 0.5, cz_w});
+        sh, _ := project(.{cx_w, 0.4, cz_w});
+        draw_filled_ellipse(sh.x, sh.y, radius * 1.4, radius * 0.5, col(0, 0, 0, 0.45));
+        // Body — concentric circles, brightest center.
+        draw_filled_circle(sc.x, sc.y, radius * 1.15, col(0.65, 0.78, 0.92, 0.85), 18);
+        draw_filled_circle(sc.x, sc.y, radius,        col(0.92, 0.96, 1.00, 1),    18);
+        draw_filled_circle(sc.x - radius * 0.35, sc.y - radius * 0.45, radius * 0.4, col(1, 1, 1, 0.95), 10);
+        if sb.forming {
+            pulse := 0.4 + 0.4 * sin(cast(float)frame_count / 6.0);
+            draw_filled_circle(sc.x, sc.y, radius * 2.2 * pulse, col(0.78, 0.92, 1.00, 0.15), 14);
+        }
+        if sb.rolling {
+            // Trailing snow puffs
+            for i: 0..2 {
+                t := cast(float)i / 3.0;
+                ox := -cast(float)sb.roll_dx * 10 * (1 + t * 1.5);
+                oy := -cast(float)sb.roll_dy * 6 * (1 + t * 1.5);
+                draw_filled_circle(sc.x + ox, sc.y + oy, 3.5 * (1 - t), col(1, 1, 1, 0.55 * (1 - t)), 8);
+            }
+        }
+    }
+}
+
+draw_snow_overlay :: () {
+    vw := cast(float)WINDOW_W;
+    vh := cast(float)WINDOW_H;
+    if !snowflakes_initialized {
+        for i: 0..SNOWFLAKE_COUNT - 1 {
+            f := *snowflakes[i];
+            f.sx = random_get_zero_to_one() * vw;
+            f.sy = random_get_zero_to_one() * vh;
+            f.vy = 0.6 + random_get_zero_to_one() * 1.8;
+            f.size = 1.0 + random_get_zero_to_one() * 2.2;
+            f.sway = random_get_zero_to_one() * TAU;
+        }
+        snowflakes_initialized = true;
+    }
+    for * f: snowflakes {
+        f.sy += f.vy;
+        f.sx += sin(f.sway + cast(float)frame_count / 18.0) * 0.45;
+        if f.sy > vh + 5 { f.sy = -6; f.sx = random_get_zero_to_one() * vw; }
+        if f.sx > vw + 6 f.sx = -6;
+        if f.sx < -6     f.sx = vw + 6;
+        draw_filled_circle(f.sx, f.sy, f.size, col(1, 1, 1, 0.78), 6);
+    }
+}
+
+// ─── Level 4 (PIRATE) implementation ────────────────────────────────────────
+
+dir_offset :: (d: Dir) -> dx: int, dy: int {
+    if d == .UP    return 0, -1;
+    if d == .DOWN  return 0, 1;
+    if d == .LEFT  return -1, 0;
+    return 1, 0;
+}
+
+add_cannon :: (cx: int, cy: int, d: Dir) {
+    if cx < 1 || cx >= COLS - 1 || cy < 1 || cy >= ROWS - 1 return;
+    // Clear the cannon's tile, the back tile (where the bomb-trigger goes),
+    // and the first tile in the firing direction so the fuse path is clean.
+    grid[cy][cx] = .EMPTY;
+    dx, dy := dir_offset(d);
+    bx := cx - dx;
+    by := cy - dy;
+    if bx >= 1 && bx < COLS - 1 && by >= 1 && by < ROWS - 1 && grid[by][bx] == .BRICK {
+        grid[by][bx] = .EMPTY;
+    }
+    fx := cx + dx;
+    fy := cy + dy;
+    if fx >= 1 && fx < COLS - 1 && fy >= 1 && fy < ROWS - 1 && grid[fy][fx] == .BRICK {
+        grid[fy][fx] = .EMPTY;
+    }
+    cn: Cannon;
+    cn.x = cx; cn.y = cy; cn.dir = d;
+    array_add(*cannons, cn);
+}
+
+setup_pirate :: () {
+    array_reset(*cannons);
+    // Fixed positions — two on each side, near the top and bottom thirds.
+    // Left-side cannons face RIGHT; right-side cannons face LEFT.
+    left_col  := CANNON_EDGE_OFFSET;
+    right_col := COLS - 1 - CANNON_EDGE_OFFSET;
+    top_row    := 3;
+    bottom_row := ROWS - 4;
+    add_cannon(left_col,  top_row,    .RIGHT);
+    add_cannon(left_col,  bottom_row, .RIGHT);
+    add_cannon(right_col, top_row,    .LEFT);
+    add_cannon(right_col, bottom_row, .LEFT);
+}
+
+tick_pirate :: () {
+    for * cn: cannons {
+        if cn.fired continue;
+        if cn.fuse_timer <= 0 continue;
+        cn.fuse_timer -= 1;
+        if cn.fuse_timer <= 0 {
+            // Fire — spawn explosion tiles along the firing direction.
+            cn.fired = true;
+            dx, dy := dir_offset(cn.dir);
+            for k: 1..CANNON_RANGE {
+                nx := cn.x + dx * k;
+                ny := cn.y + dy * k;
+                if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
+                if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER break;
+                if grid[ny][nx] == .BRICK {
+                    grid[ny][nx] = .BRICK_MELTING;
+                    mb: MeltingBrick;
+                    mb.x = nx; mb.y = ny; mb.timer = MELT_DURATION;
+                    array_add(*melting_bricks, mb);
+                    spawn_death_fx(cast(float)nx, cast(float)ny, current_theme.melt_top, false);
+                    ne: Explosion;
+                    ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                    array_add(*explosions_list, ne);
+                    break;
+                }
+                ne: Explosion;
+                ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                array_add(*explosions_list, ne);
+            }
+            add_shake(SHAKE_PER_CHAIN);
+            recent_boom = 1.0;
+        }
+    }
+}
+
+on_explosion_pirate :: (bx: int, by: int, range: int) {
+    // Light any cannon whose back tile lies in this bomb's blast pattern.
+    for * cn: cannons {
+        if cn.fired continue;
+        if cn.fuse_timer > 0 continue;
+        dx, dy := dir_offset(cn.dir);
+        back_x := cn.x - dx;
+        back_y := cn.y - dy;
+        if back_x < 0 || back_x >= COLS || back_y < 0 || back_y >= ROWS continue;
+        if bomb_hits_tile(bx, by, range, back_x, back_y) {
+            cn.fuse_timer = CANNON_FUSE_TICKS;
+            spawn_fx(cast(float) back_x, cast(float) back_y, col(1, 0.7, 0.25, 1), .SMALL);
+        }
+    }
+}
+
+draw_cannon_billboard :: (cx: float, cy: float, cn: Cannon) {
+    body_d := col(0.16, 0.16, 0.18, 1);
+    body_m := col(0.34, 0.34, 0.40, 1);
+    body_h := col(0.62, 0.62, 0.72, 1);
+    // Drop shadow
+    draw_filled_ellipse(cx, cy + 9, 24, 7, col(0, 0, 0, 0.50));
+    // Body box
+    draw_rounded_rect(cx - 14, cy - 7, 28, 16, 4, body_d);
+    draw_rounded_rect(cx - 13, cy - 6, 26, 14, 3, body_m);
+    draw_filled_rect(cx - 12, cy - 5, 24, 2, body_h);
+    // Barrel oriented by direction
+    if cn.dir == {
+        case .UP;
+            draw_filled_rect(cx - 5, cy - 24, 10, 20, body_d);
+            draw_filled_rect(cx - 4, cy - 23, 8, 18, body_m);
+            draw_filled_circle(cx, cy - 24, 5, body_d, 12);
+            draw_filled_circle(cx, cy - 24, 3, col(0.06, 0.05, 0.05, 1), 10);
+        case .DOWN;
+            draw_filled_rect(cx - 5, cy + 4, 10, 20, body_d);
+            draw_filled_rect(cx - 4, cy + 5, 8, 18, body_m);
+            draw_filled_circle(cx, cy + 24, 5, body_d, 12);
+            draw_filled_circle(cx, cy + 24, 3, col(0.06, 0.05, 0.05, 1), 10);
+        case .LEFT;
+            draw_filled_rect(cx - 24, cy - 5, 20, 10, body_d);
+            draw_filled_rect(cx - 23, cy - 4, 18, 8, body_m);
+            draw_filled_circle(cx - 24, cy, 5, body_d, 12);
+            draw_filled_circle(cx - 24, cy, 3, col(0.06, 0.05, 0.05, 1), 10);
+        case .RIGHT;
+            draw_filled_rect(cx + 4, cy - 5, 20, 10, body_d);
+            draw_filled_rect(cx + 5, cy - 4, 18, 8, body_m);
+            draw_filled_circle(cx + 24, cy, 5, body_d, 12);
+            draw_filled_circle(cx + 24, cy, 3, col(0.06, 0.05, 0.05, 1), 10);
+    }
+    // Fuse spark at the back tile when lit
+    if cn.fuse_timer > 0 && !cn.fired {
+        flicker := 0.6 + 0.4 * sin(cast(float)frame_count / 2.5);
+        sparkc := col(1.0, 0.78, 0.30, 1);
+        bx, by: float;
+        if cn.dir == {
+            case .UP;    bx = cx; by = cy + 12;
+            case .DOWN;  bx = cx; by = cy - 12;
+            case .LEFT;  bx = cx + 16; by = cy;
+            case .RIGHT; bx = cx - 16; by = cy;
+        }
+        draw_filled_circle(bx, by, 5 * flicker, col(1.0, 0.55, 0.20, 0.55), 10);
+        draw_filled_circle(bx, by, 3 * flicker, sparkc, 8);
+        draw_filled_circle(bx, by, 1.5 * flicker, col(1, 1, 1, 1), 6);
+    }
+}
+
+draw_cannons_row :: (r: int) {
+    for cn: cannons {
+        if cn.y != r continue;
+        if cn.fired continue;  // burned through after firing — gone visually
+        cx_w := cast(float)(cn.x * TILE) + cast(float)TILE * 0.5;
+        cz_w := cast(float)(cn.y * TILE) + cast(float)TILE * 0.5;
+        sc, _ := project(.{cx_w, cast(float)TILE * 0.25, cz_w});
+        draw_cannon_billboard(sc.x, sc.y, cn);
+    }
+}
+
+// ─── Level 5 (BEACH) implementation ─────────────────────────────────────────
+
+setup_beach :: () {
+    array_reset(*fishes);
+    fish_teleport = .{};
+
+    // Pre-cleared spawn corridors must remain walkable, so only consider tiles
+    // that are currently EMPTY. Convert a sparse handful into WATER (blocked)
+    // and place a few FISH on remaining EMPTY tiles.
+    water_count := 0;
+    for r: 1..ROWS - 2 {
+        for c: 1..COLS - 2 {
+            if grid[r][c] != .EMPTY continue;
+            // Keep all spawn corners walkable for the player + enemies.
+            if abs(c - 1) + abs(r - 1) < 3 continue;
+            if abs(c - (COLS - 2)) + abs(r - (ROWS - 2)) < 3 continue;
+            if abs(c - (COLS - 2)) + abs(r - 1) < 3 continue;
+            if abs(c - 1) + abs(r - (ROWS - 2)) < 3 continue;
+            if water_count >= BEACH_WATER_MAX continue;
+            if random_get_zero_to_one() < BEACH_WATER_DENSITY {
+                grid[r][c] = .WATER;
+                water_count += 1;
+            }
+        }
+    }
+
+    // Place fish on EMPTY tiles, away from each other.
+    for attempts: 0..80 {
+        if fishes.count >= BEACH_FISH_COUNT break;
+        c := 1 + cast(int)(random_get() % cast(u64)(COLS - 2));
+        r := 1 + cast(int)(random_get() % cast(u64)(ROWS - 2));
+        if grid[r][c] != .EMPTY continue;
+        if abs(c - 1) + abs(r - 1) < 4 continue;
+        clash := false;
+        for f: fishes if abs(f.x - c) + abs(f.y - r) < 4 { clash = true; break; }
+        if clash continue;
+        f: Fish;
+        f.x = c; f.y = r;
+        f.bob_phase = random_get_zero_to_one() * TAU;
+        array_add(*fishes, f);
+    }
+}
+
+tick_beach :: () {
+    for * f: fishes f.bob_phase += 0.04;
+
+    if !fish_teleport.active return;
+    fish_teleport.phase += 1;
+    // Mid-teleport: swap player to dst at the exact phase boundary.
+    if fish_teleport.phase == FISH_SWALLOW_TICKS {
+        player.x = fish_teleport.dst_x;
+        player.y = fish_teleport.dst_y;
+        player.rx = cast(float) fish_teleport.dst_x;
+        player.ry = cast(float) fish_teleport.dst_y;
+        spawn_fx(cast(float) fish_teleport.dst_x, cast(float) fish_teleport.dst_y, col(0.4, 0.78, 1.0, 1), .BIG);
+    }
+    if fish_teleport.phase >= FISH_TOTAL_TICKS {
+        fish_teleport.active = false;
+        player.locked_by_mechanic = false;
+    }
+}
+
+on_player_moved_beach :: () {
+    if fish_teleport.active return;
+    for f, fi: fishes {
+        if player.x == f.x && player.y == f.y {
+            if fishes.count < 2 return;
+            // Random different fish.
+            idx := fi;
+            for attempt: 0..30 {
+                idx = cast(int)(random_get() % cast(u64) fishes.count);
+                if idx != fi break;
+            }
+            if idx == fi return;
+            fish_teleport.active = true;
+            fish_teleport.phase = 0;
+            fish_teleport.src_x = f.x;
+            fish_teleport.src_y = f.y;
+            fish_teleport.dst_x = fishes[idx].x;
+            fish_teleport.dst_y = fishes[idx].y;
+            player.locked_by_mechanic = true;
+            spawn_fx(cast(float)f.x, cast(float)f.y, col(0.4, 0.78, 1.0, 1), .BIG);
+            return;
+        }
+    }
+}
+
+draw_fish_billboard :: (cx: float, cy: float) {
+    // Water pool under the fish
+    draw_filled_ellipse(cx, cy + 7, 22, 8, col(0.12, 0.36, 0.62, 0.85));
+    draw_filled_ellipse(cx, cy + 6, 20, 7, col(0.32, 0.58, 0.85, 0.70));
+    // Fish body — koi-orange
+    body_d := col(0.78, 0.28, 0.10, 1);
+    body_m := col(1.00, 0.55, 0.18, 1);
+    body_h := col(1.00, 0.88, 0.55, 1);
+    // Tail
+    draw_triangle(cx - 17, cy - 6, cx - 17, cy + 6, cx - 8, cy, body_d);
+    draw_triangle(cx - 15, cy - 5, cx - 15, cy + 5, cx - 8, cy, body_m);
+    // Body
+    draw_filled_ellipse(cx, cy, 13, 7, body_d);
+    draw_filled_ellipse(cx, cy, 11, 5.5, body_m);
+    draw_filled_ellipse(cx, cy + 1.5, 10, 3, body_h);
+    // Fin
+    draw_triangle(cx, cy - 4, cx + 4, cy - 9, cx + 6, cy - 3, body_d);
+    // Eye
+    draw_filled_circle(cx + 5, cy - 1, 1.8, col(1, 1, 1, 1), 6);
+    draw_filled_circle(cx + 5.5, cy - 1, 1.0, col(0.1, 0.1, 0.15, 1), 5);
+}
+
+draw_fishes_row :: (r: int) {
+    for f: fishes {
+        if f.y != r continue;
+        cx_w := cast(float)(f.x * TILE) + cast(float)TILE * 0.5;
+        cz_w := cast(float)(f.y * TILE) + cast(float)TILE * 0.5;
+        sc, _ := project(.{cx_w, cast(float)TILE * 0.12, cz_w});
+        bob := sin(f.bob_phase) * 2.0;
+        draw_fish_billboard(sc.x, sc.y + bob);
+    }
+}
+
+// Water tile rendering — drawn from the floor pass when grid[r][c] == .WATER.
+// Beach-only currently; if another level uses WATER tiles it would benefit
+// from a per-theme draw_water helper.
+draw_water_3d :: (c: int, r: int) {
+    x0 := cast(float)(c * TILE);
+    x1 := x0 + cast(float)TILE;
+    z0 := cast(float)(r * TILE);
+    z1 := z0 + cast(float)TILE;
+    deep  := col(0.08, 0.22, 0.42, 1);
+    base  := col(0.16, 0.40, 0.62, 1);
+    light := col(0.40, 0.70, 0.92, 1);
+    foam  := col(0.92, 0.96, 1.00, 1);
+
+    // Water plane sits slightly below the boardwalk.
+    h: float = -10.0;
+    draw_quad_3d(.{x0, h, z0}, .{x1, h, z0}, .{x1, h, z1}, .{x0, h, z1}, deep);
+    inset := 4.0;
+    draw_quad_3d(.{x0 + inset, h + 0.1, z0 + inset},
+                 .{x1 - inset, h + 0.1, z0 + inset},
+                 .{x1 - inset, h + 0.1, z1 - inset},
+                 .{x0 + inset, h + 0.1, z1 - inset}, base);
+
+    // Animated highlights
+    t := cast(float)frame_count / 24.0;
+    seed := cast(float)(c * 13 + r * 31);
+    cx_w := (x0 + x1) * 0.5;
+    cz_w := (z0 + z1) * 0.5;
+    for i: 0..2 {
+        phase := t + seed + cast(float)i * 1.7;
+        ox := sin(phase) * (cast(float)TILE * 0.18);
+        oz := cos(phase * 1.3) * (cast(float)TILE * 0.18);
+        sc, _ := project(.{cx_w + ox, h + 0.4, cz_w + oz});
+        s := screen_scale_at(.{cx_w + ox, h + 0.4, cz_w + oz});
+        rr := (5.0 + sin(phase * 2.0) * 2.0) * s;
+        if rr > 0.5 draw_filled_circle(sc.x, sc.y, rr, col(light.x, light.y, light.z, 0.55), 14);
+    }
+
+    // Foam ring around the hole — implies the wooden boardwalk's edge.
+    e :: 3.0;
+    draw_quad_3d(.{x0, 0.05, z0}, .{x1, 0.05, z0}, .{x1, 0.05, z0 + e}, .{x0, 0.05, z0 + e}, foam);
+    draw_quad_3d(.{x0, 0.05, z1 - e}, .{x1, 0.05, z1 - e}, .{x1, 0.05, z1}, .{x0, 0.05, z1}, foam);
+    draw_quad_3d(.{x0, 0.05, z0}, .{x0 + e, 0.05, z0}, .{x0 + e, 0.05, z1}, .{x0, 0.05, z1}, foam);
+    draw_quad_3d(.{x1 - e, 0.05, z0}, .{x1, 0.05, z0}, .{x1, 0.05, z1}, .{x1 - e, 0.05, z1}, foam);
+}
+
+draw_beach_overlay :: () {
+    // Player teleport flash. The world-space player render is suppressed
+    // while teleporting; show a column of bubbles at the active endpoint.
+    if !fish_teleport.active return;
+    swallow_end := FISH_SWALLOW_TICKS;
+    travel_end  := FISH_SWALLOW_TICKS + FISH_TRAVEL_TICKS;
+    if fish_teleport.phase < swallow_end {
+        // Sinking at src
+        tx := cast(float) fish_teleport.src_x;
+        ty := cast(float) fish_teleport.src_y;
+        cx_w := tx * cast(float)TILE + cast(float)TILE * 0.5;
+        cz_w := ty * cast(float)TILE + cast(float)TILE * 0.5;
+        sc, _ := project(.{cx_w, cast(float)TILE * 0.15, cz_w});
+        for i: 0..5 {
+            t := cast(float)((fish_teleport.phase + i * 3) % 20) / 20.0;
+            r := (1.0 - t) * 3.0 + 1.0;
+            draw_filled_circle(sc.x + sin(cast(float)i) * 6, sc.y - t * 14, r, col(0.85, 0.95, 1.0, 0.75 * (1 - t)), 6);
+        }
+    } else if fish_teleport.phase < travel_end {
+        // brief curtain in the middle of travel
+        a := 0.18;
+        draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H, col(0.35, 0.65, 0.95, a));
+    } else {
+        // Bursting up at dst
+        tx := cast(float) fish_teleport.dst_x;
+        ty := cast(float) fish_teleport.dst_y;
+        cx_w := tx * cast(float)TILE + cast(float)TILE * 0.5;
+        cz_w := ty * cast(float)TILE + cast(float)TILE * 0.5;
+        sc, _ := project(.{cx_w, cast(float)TILE * 0.15, cz_w});
+        for i: 0..5 {
+            t := cast(float)((fish_teleport.phase + i * 4) % 18) / 18.0;
+            r := t * 3.0 + 1.0;
+            draw_filled_circle(sc.x + sin(cast(float)i + 1) * 7, sc.y - (1 - t) * 18, r, col(0.92, 0.97, 1.0, 0.78 * (1 - t)), 6);
+        }
+    }
 }
 
 place_bomb :: () {
     if player.stun_timer > 0 return;
-    if player_is_riding() return;
+    if player.locked_by_mechanic return;
     if player.hopping return;
     active_player_bombs := 0;
     for bombs if it.owner == 0 active_player_bombs += 1;
@@ -2625,6 +3934,14 @@ place_bomb :: () {
 }
 
 explode :: (b: Bomb) {
+    // Fire the level-mechanic hook so per-level entities (snowballs, cannon
+    // fuses, etc) can react to a bomb going off.
+    if current_mechanic.on_explosion current_mechanic.on_explosion(b.x, b.y, b.range);
+
+    // Only the originating bomb plays the explosion sound — chain links share
+    // the origin's blast. Quiet volume so 10 simultaneous bombs don't deafen.
+    if !b.chain play_sfx(*sound_explosion, 0.05);
+
     e: Explosion;
     e.x = b.x; e.y = b.y;
     e.timer = EXPLOSION_DURATION;
@@ -2642,7 +3959,7 @@ explode :: (b: Bomb) {
             nx := b.x + dx * i;
             ny := b.y + dy * i;
             if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
-            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER break;
 
             hit_bomb := false;
             for * bombs {
@@ -2739,7 +4056,7 @@ is_in_blast :: (x: int, y: int, extra: [] Bomb = .[]) -> bool {
                 nx := bx + dx * i;
                 ny := by + dy * i;
                 if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
-                if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+                if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER break;
                 if nx == x && ny == y return true;
                 if grid[ny][nx] == .BRICK break;
             }
@@ -2756,6 +4073,7 @@ can_walk_safe :: (x: int, y: int) -> bool {
     if x < 0 || x >= COLS || y < 0 || y >= ROWS return false;
     if grid[y][x] != .EMPTY return false;
     for bombs if !it.punching && it.x == x && it.y == y return false;
+    if current_mechanic.tile_blocked && current_mechanic.tile_blocked(x, y) return false;
     return true;
 }
 
@@ -2865,7 +4183,7 @@ bomb_hits_tile :: (bx: int, by: int, range: int, x: int, y: int) -> bool {
             nx := bx + dx * i;
             ny := by + dy * i;
             if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
-            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER break;
             if nx == x && ny == y return true;
             if grid[ny][nx] == .BRICK break;
         }
@@ -2885,7 +4203,7 @@ count_bricks_hit :: (bx: int, by: int, range: int) -> int {
             nx := bx + dx * i;
             ny := by + dy * i;
             if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
-            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER break;
             if grid[ny][nx] == .BRICK { n += 1; break; }
         }
     }
@@ -2935,7 +4253,7 @@ dijkstra_through_bricks :: (sx: int, sy: int) -> DijkstraField {
             nx := bx + DIRS[dir_idx * 2];
             ny := by + DIRS[dir_idx * 2 + 1];
             if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS continue;
-            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING continue;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING || grid[ny][nx] == .WATER continue;
             blocked := false;
             for bombs if !it.punching && it.x == nx && it.y == ny { blocked = true; break; }
             if blocked continue;
@@ -3336,12 +4654,13 @@ update_single_enemy :: (e: *Enemy) {
 
 move_player :: (dx: int, dy: int) {
     if player.stun_timer > 0 return;
-    if player_is_riding() return;
+    if player.locked_by_mechanic return;
     if player.hopping return;
     nx := player.x + dx;
     ny := player.y + dy;
     if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS return;
     if grid[ny][nx] != .EMPTY return;
+    if current_mechanic.tile_blocked && current_mechanic.tile_blocked(nx, ny) return;
 
     bomb_idx := -1;
     for bombs {
@@ -3386,7 +4705,7 @@ move_player :: (dx: int, dy: int) {
 punch_bomb :: () {
     if !player.has_punch return;
     if player.stun_timer > 0 return;
-    if player_is_riding() return;
+    if player.locked_by_mechanic return;
     if player.hopping return;
     ddx, ddy: int;
     if player.dir == {
@@ -3465,11 +4784,13 @@ update :: () {
         }
         if moved {
             move_timer = player.move_delay;
-            try_mount_cart();
+            if current_mechanic.on_player_moved current_mechanic.on_player_moved();
         }
     }
 
-    update_mine_cart();
+    // Per-level mechanic update. Inactive levels have a null tick — zero cost.
+    if current_mechanic.tick current_mechanic.tick();
+
     update_player_hop();
     update_enemy_hops();
 
@@ -3634,12 +4955,14 @@ update :: () {
             game_over_delay = 50;
             hit_flash_timer = 22;
             player_won = false;
+            play_sfx(*sound_hit, 0.55);
         }
         for * en: enemies {
             if en.alive && !en.hopping && it.x == en.x && it.y == en.y {
                 en.alive = false;
                 spawn_death_fx(en.rx, en.ry, en.glow, true);
                 drop_enemy_powerups(en);
+                play_sfx(*sound_hit, 0.55);
             }
         }
     }
@@ -3706,6 +5029,7 @@ update :: () {
                     player.move_delay = max(PLAYER_MOVE_DELAY_MIN, player.move_delay - SKATE_BOOST_PLAYER);
                 }
                 spawn_death_fx(cast(float)p.x, cast(float)p.y, powerup_color(p.type), false);
+                play_sfx(*sound_powerup, 0.70);
                 array_unordered_remove_by_index(*powerups, i);
                 i -= 1;
                 continue;
@@ -3864,8 +5188,10 @@ render :: () {
 
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
-            if grid[r][c] != .WALL && grid[r][c] != .BRICK {
+            if grid[r][c] == .EMPTY || grid[r][c] == .BRICK_MELTING {
                 draw_floor_3d(c, r);
+            } else if grid[r][c] == .WATER {
+                draw_water_3d(c, r);
             }
         }
     }
@@ -3873,8 +5199,8 @@ render :: () {
     // Floor light pools (bombs, powerups, explosions, characters) — drawn over floor, under walls
     draw_floor_lights();
 
-    // Volcanic level: lay the mine cart's tracks over the floor.
-    draw_mine_cart_rails();
+    // Level mechanic ground-pass (e.g. mine cart rails). No-op for vanilla.
+    if current_mechanic.draw_ground current_mechanic.draw_ground();
 
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
@@ -3932,16 +5258,16 @@ render :: () {
             draw_bomb(it, sc.x, sc.y);
         }
 
-        // Mine cart sits between bombs and characters in painter order so the
-        // player can render on top of it while riding.
-        if mine_cart.active && cast(int)(mine_cart.ry + 0.5) == r {
-            cx_w := mine_cart.rx * cast(float)TILE + cast(float)TILE * 0.5;
-            cz_w := mine_cart.ry * cast(float)TILE + cast(float)TILE * 0.5;
-            sc, _ := project(.{cx_w, cast(float)TILE * 0.18, cz_w});
-            draw_mine_cart(sc.x, sc.y);
-        }
+        // Level mechanic per-row pass. The cart (volcanic) draws here so it
+        // depth-sorts correctly against the row's player/enemies/bombs.
+        if current_mechanic.draw_row current_mechanic.draw_row(r);
 
-        if !player.hopping && player.y == r {
+        // Player render: skip while airborne (hop handles its own draw below)
+        // and while a beach fish has swallowed us mid-teleport.
+        player_hidden := fish_teleport.active &&
+            fish_teleport.phase >= FISH_SWALLOW_TICKS - 4 &&
+            fish_teleport.phase <= FISH_SWALLOW_TICKS + FISH_TRAVEL_TICKS + 4;
+        if !player.hopping && !player_hidden && player.y == r {
             cx_w := player.rx * cast(float)TILE + cast(float)TILE * 0.5;
             cz_w := player.ry * cast(float)TILE + cast(float)TILE * 0.5;
             // Lift the player onto the cart while riding.
@@ -4076,6 +5402,10 @@ render :: () {
         }
     }
 
+    // Level mechanic overlay (e.g. snow particles falling). After the world,
+    // before the HUD.
+    if current_mechanic.draw_overlay current_mechanic.draw_overlay();
+
     draw_hud_panel();
 
     Simp.immediate_flush();
@@ -4153,8 +5483,16 @@ render :: () {
 load_level :: (kind: LevelKind) {
     current_level = kind;
     current_theme = theme_for(kind);
+
+    // Tear down any previous mechanic state so stale globals can't leak
+    // between level switches (e.g. mine_cart left mid-ride going to vanilla).
+    mine_cart = .{};
+    array_reset(*mine_cart_path);
+
+    current_mechanic = mechanic_for(kind);
     init_grid();
-    setup_mine_cart();
+    if current_mechanic.setup current_mechanic.setup();
+
     // Re-seed atmosphere so motes pick up the new theme palette.
     atmosphere_initialized = false;
 }
@@ -4171,6 +5509,7 @@ reset_state :: () {
     player.hop_t = 0;
     player.hop_dx = 0;
     player.hop_dy = 0;
+    player.locked_by_mechanic = false;
 
     enemies[0].x = COLS - 2; enemies[0].y = ROWS - 2;
     enemies[0].rx = cast(float)(COLS - 2); enemies[0].ry = cast(float)(ROWS - 2);
@@ -4257,6 +5596,15 @@ main :: () {
         }
     }
 
+    // Audio init. If anything fails we set audio_ready=false and the rest of
+    // the game runs silently — play_sfx() short-circuits.
+    audio_ready = Sound.sound_player_init(.{});
+    if audio_ready {
+        sound_explosion = Sound.load_audio_file("data/explosion.wav");
+        sound_hit       = Sound.load_audio_file("data/hitHurt.wav");
+        sound_powerup   = Sound.load_audio_file("data/powerUp.wav");
+    }
+
     reset_state();
 
     while !should_quit {
@@ -4300,6 +5648,18 @@ main :: () {
                         current_level = .VOLCANIC;
                         reset_state();
                     }
+                    if key == cast(Input.Key_Code) #char "3" {
+                        current_level = .SNOW;
+                        reset_state();
+                    }
+                    if key == cast(Input.Key_Code) #char "4" {
+                        current_level = .PIRATE;
+                        reset_state();
+                    }
+                    if key == cast(Input.Key_Code) #char "5" {
+                        current_level = .BEACH;
+                        reset_state();
+                    }
                     if key == .F11 {
                         is_fullscreen = !is_fullscreen;
                         success, w, h := toggle_fullscreen(window, is_fullscreen, *saved_window_info);
@@ -4316,7 +5676,10 @@ main :: () {
 
         update();
         render();
+        if audio_ready Sound.update();
         Simp.swap_buffers(window);
         sleep_milliseconds(1);
     }
+
+    if audio_ready Sound.sound_player_shutdown();
 }
