@@ -1,13 +1,27 @@
 # Development Log
 
-## 2026-05-17 — Initial build
+## Foundation — game in Jai
 
-Wizard-themed Bomberman in `game.jai` using Simp for rendering and Window_Creation/Input. 15×13 grid, walls + bricks, BFS-driven enemy AI (3 warlocks), bomb chain reactions, powerups (bomb, fire, kick, punch) with melt animations, smooth lerped movement.
+Wizard-themed Bomberman in `game.jai` using Simp + Window_Creation + Input. 15×13 grid, walls + bricks, smooth lerped movement, BFS-driven enemy AI (3 warlocks), bomb chain reactions, powerups (bomb / fire / kick / punch) with melt animations.
 
-## 2026-05-17 — Fixes & visuals
+## Render layer — 3D look
 
-LEFT_HANDED render target so origin sits top-left; F11 fullscreen with a centered aspect-preserving viewport so resizing never stretches. Bigger, clearer characters — distinct silhouettes per enemy (horned demon / tall wizard / hooded necromancer) and a glowing-orb staff for the player. Walls and bricks got drop-shadow strips for depth; floor got subtle twinkles.
+`LEFT_HANDED` render target (top-left origin), F11 fullscreen with a centered aspect-preserving viewport (no stretching). Then a switch to a software-projected 3D pipeline: custom perspective + view matrices feed `project(Vector3) → Vector2`, walls/bricks render as shaded cubes built from 2D triangles, floor/characters/bombs/powerups stay as billboards at projected positions. Painter's algorithm row-by-row, no depth buffer. Camera pitch ~82° (near-zenithal) so layout is easy to read.
 
-## 2026-05-17 — 3D look
+## Feedback layer — DeathFx + polish
 
-Switched the scene to a software-projected 3D pipeline. Custom perspective + view matrices feed `project(Vector3) → screen Vector2`; walls and bricks render as shaded cubes via 2D triangles, characters/bombs/powerups stay as billboards at projected positions. Painter's algorithm row-by-row, no depth buffer. Camera pitch ~82° (near-zenithal) so layout is easy to read and nothing important hides behind a brick.
+Unified `DeathFx` system (kinds: BIG / SMALL / BOING / DUST) covers every destruction and reaction: brick / powerup / enemy / player death, bomb placement, powerup pickup, footsteps, kick-slide trail, bomb hop landings. `game_over_delay` lets the death animation play out before the screen flips. Hit / victory screen flashes, edge vignette. Walls get a mortar cross + highlight fleck on top, bricks get a rim + grain on top, floor draws AO strips against adjacent solid tiles. Cube lighting tightened for stronger contrast.
+
+## AI rewrite — no more dancing
+
+Pursuit BFS gained an `avoid_blast` flag, fixing the loop where the enemy pathfound back through the bomb it just escaped. Single danger check (`is_in_blast` only). When in danger the enemy commits to a flee destination until it's actually reached. `last_x, last_y` prevents immediate U-turns. When safe but with no blast-free path, the enemy stays put instead of shuffling.
+
+## Sprites — directional + knocked out
+
+All three enemies now react to facing (red demon horns / purple wizard hat / green necromancer hood reorient, pupils track). When stunned, characters get X-eyes that wobble plus the existing yellow stars — the 1s knock-down is now clearly readable.
+
+## Punch arc-hop + skates
+
+Punching launches the bomb on a 2-tile arc; if the landing tile has a wall/brick or a stunned character, the bomb bounces another **1 tile** and re-checks. Powerup → destroys it and lands. Edge → wraps via modulo. Bomb timer freezes while airborne; BOING FX on every landing; ground shadow stays under the arc. Kicks now leave a small dust trail per tile.
+
+New `SKATE` powerup. Movement speed moved off the global constants onto per-entity `move_delay` fields (player + enemy), and base values slowed (player `8 → 10`, enemy `16 → 20`). Each skate shaves **1 frame** off `move_delay`; floors at 7 (player) / 16 (enemy). Intentionally minor — top out at ~30% speed boost for the player so it's a filler upgrade, not a must-grab.

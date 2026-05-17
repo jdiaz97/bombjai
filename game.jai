@@ -14,7 +14,7 @@ ROWS :: 13;
 TILE :: 60;
 BOMB_TIMER :: 135;
 POWERUP_DROP_RATE :: 0.5;
-ENEMY_MOVE_DELAY :: 16;
+ENEMY_MOVE_DELAY :: 20;
 START_FIRE_RANGE :: 1;
 START_MAX_BOMBS :: 1;
 ENEMY_FIRE_RANGE :: 1;
@@ -23,13 +23,21 @@ MELT_DURATION :: 14;
 POWERUP_SPAWN_DELAY :: 35;
 POWERUP_MELT_DURATION :: 12;
 BRICK_DENSITY :: 0.65;
-PLAYER_MOVE_DELAY :: 8;
+PLAYER_MOVE_DELAY :: 10;
 AI_BOMB_DIST :: 3;
 BOMB_SLIDE_SPEED :: 4;
 STUN_DURATION :: 60;
 KICK_MAX :: 4;
 PUNCH_MAX :: 4;
+SKATE_MAX :: 6;
+SKATE_BOOST_PLAYER :: 1;
+SKATE_BOOST_ENEMY :: 1;
+PLAYER_MOVE_DELAY_MIN :: 7;
+ENEMY_MOVE_DELAY_MIN :: 16;
 LERP_SPEED :: 0.25;
+PUNCH_HOP_FRAMES :: 14;
+PUNCH_ARC_HEIGHT :: 38.0;
+PLAYER_STUN :: 60;
 
 WINDOW_W :: COLS * TILE;
 WINDOW_H :: ROWS * TILE;
@@ -53,6 +61,7 @@ PType :: enum u8 {
     FIRE;
     KICK;
     PUNCH;
+    SKATE;
 }
 
 Player :: struct {
@@ -63,6 +72,9 @@ Player :: struct {
     dir: Dir;
     has_kick: bool;
     has_punch: bool;
+    stun_timer: int;
+    move_delay: int;
+    skate_count: int;
 }
 
 Enemy :: struct {
@@ -72,6 +84,8 @@ Enemy :: struct {
     max_bombs: int;
     fire_range: int;
     move_timer: int;
+    move_delay: int;
+    skate_count: int;
     color: Vector4;
     glow: Vector4;
     id: int;
@@ -79,6 +93,8 @@ Enemy :: struct {
     stun_timer: int;
     flee_x, flee_y: int;
     has_flee: bool;
+    last_x, last_y: int;   // anti-backtrack memory; -1 = none
+    idle_streak: int;      // ticks spent staying put; lets us nudge if stuck too long
 }
 
 Bomb :: struct {
@@ -89,6 +105,12 @@ Bomb :: struct {
     slide_dx, slide_dy: int;
     slide_timer: int;
     chain: bool;
+    // Punch flight
+    punching: bool;
+    punch_dx, punch_dy: int;
+    punch_from_x, punch_from_y: float;     // unwrapped continuous (interp source)
+    punch_target_x, punch_target_y: float; // unwrapped continuous (interp dest; may go out of bounds)
+    punch_t: float;                        // 0..1 progress in current hop
 }
 
 Explosion :: struct {
@@ -115,6 +137,21 @@ Powerup :: struct {
     delay: int;
 }
 
+FxKind :: enum u8 {
+    SMALL;      // powerup destroy, brick destroy, bomb place, powerup pickup
+    BIG;        // player/enemy death
+    BOING;      // bomb landing/bouncing during a punch
+    DUST;       // footstep or slide trail — quiet ground puff
+}
+
+DeathFx :: struct {
+    x, y: float;        // world grid coordinates (matches rx/ry for moving entities)
+    color: Vector4;
+    timer: int;
+    duration: int;
+    kind: FxKind;
+}
+
 BFSNode :: struct {
     x, y: int;
 }
@@ -129,8 +166,13 @@ bombs: [..] Bomb;
 explosions_list: [..] Explosion;
 melting_bricks: [..] MeltingBrick;
 melting_powerups: [..] MeltingPowerup;
+death_fx_list: [..] DeathFx;
 kick_spawned: int;
 punch_spawned: int;
+skate_spawned: int;
+game_over_delay: int;       // counts down after a fatal hit so the death FX plays before the screen flips
+hit_flash_timer: int;       // brief red overlay when player gets hit
+victory_flash_timer: int;   // gold overlay when last enemy dies
 
 key_up: bool;
 key_down: bool;
@@ -152,6 +194,37 @@ cam_mvp: Matrix4;
 
 col :: (r: float, g: float, b: float, a: float) -> Vector4 {
     return .{r, g, b, a};
+}
+
+powerup_color :: (t: PType) -> Vector4 {
+    if t == {
+        case .BOMB;  return col(0.702, 0.533, 1.0, 1);
+        case .FIRE;  return col(1.0, 0.671, 0.251, 1);
+        case .KICK;  return col(0, 0.737, 0.827, 1);
+        case .PUNCH; return col(1.0, 0.757, 0.027, 1);
+        case .SKATE; return col(0.420, 0.812, 1.0, 1);
+    }
+    return col(1, 1, 1, 1);
+}
+
+spawn_fx :: (x: float, y: float, color: Vector4, kind: FxKind) {
+    fx: DeathFx;
+    fx.x = x;
+    fx.y = y;
+    fx.color = color;
+    if kind == {
+        case .BIG;      fx.duration = 36;
+        case .SMALL;    fx.duration = 22;
+        case .BOING;    fx.duration = 18;
+        case .DUST;     fx.duration = 12;
+    }
+    fx.timer = fx.duration;
+    fx.kind = kind;
+    array_add(*death_fx_list, fx);
+}
+
+spawn_death_fx :: (x: float, y: float, color: Vector4, big: bool) {
+    spawn_fx(x, y, color, ifx big then FxKind.BIG else FxKind.SMALL);
 }
 
 init_grid :: () {
@@ -321,9 +394,9 @@ draw_cube_3d :: (cx: float, cz: float, half_w: float, height: float, top_c: Vect
     y0 := 0.0;         y1 := height;
 
     top_color   := shade(top_c, 1.0);
-    front_color := shade(side_c, 0.85);
-    left_color  := shade(side_c, 0.95);
-    right_color := shade(side_c, 0.62);
+    front_color := shade(side_c, 0.72);
+    left_color  := shade(side_c, 0.92);
+    right_color := shade(side_c, 0.48);
 
     draw_quad_3d(.{x0, y1, z1}, .{x1, y1, z1}, .{x1, y1, z0}, .{x0, y1, z0}, top_color);
     draw_quad_3d(.{x0, y0, z1}, .{x1, y0, z1}, .{x1, y1, z1}, .{x0, y1, z1}, front_color);
@@ -337,6 +410,11 @@ screen_scale_at :: (world: Vector3) -> float {
     return abs(a.y - b.y) / cast(float) TILE;
 }
 
+tile_is_solid :: (c: int, r: int) -> bool {
+    if c < 0 || c >= COLS || r < 0 || r >= ROWS return false;
+    return grid[r][c] == .WALL || grid[r][c] == .BRICK;
+}
+
 draw_floor_3d :: (c: int, r: int) {
     x0 := cast(float)(c * TILE);
     x1 := x0 + cast(float)TILE;
@@ -346,33 +424,48 @@ draw_floor_3d :: (c: int, r: int) {
     base: Vector4;
     accent: Vector4;
     if (r + c) % 2 == 0 {
-        base   = col(0.165, 0.153, 0.251, 1);
-        accent = col(0.145, 0.133, 0.220, 1);
-    } else {
-        base   = col(0.188, 0.176, 0.282, 1);
+        base   = col(0.196, 0.180, 0.290, 1);
         accent = col(0.169, 0.157, 0.267, 1);
+    } else {
+        base   = col(0.220, 0.204, 0.318, 1);
+        accent = col(0.196, 0.184, 0.302, 1);
     }
     draw_quad_3d(.{x0, 0, z0}, .{x1, 0, z0}, .{x1, 0, z1}, .{x0, 0, z1}, base);
     inset := 2.0;
     draw_quad_3d(.{x0 + inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z1 - inset}, .{x0 + inset, 0.1, z1 - inset}, accent);
 
+    ao_w :: 12.0;
+    ao_c := col(0.012, 0.008, 0.024, 0.55);
+    if tile_is_solid(c, r - 1) {
+        draw_quad_3d(.{x0, 0.2, z0}, .{x1, 0.2, z0}, .{x1, 0.2, z0 + ao_w}, .{x0, 0.2, z0 + ao_w}, ao_c);
+    }
+    if tile_is_solid(c, r + 1) {
+        draw_quad_3d(.{x0, 0.2, z1 - ao_w}, .{x1, 0.2, z1 - ao_w}, .{x1, 0.2, z1}, .{x0, 0.2, z1}, ao_c);
+    }
+    if tile_is_solid(c - 1, r) {
+        draw_quad_3d(.{x0, 0.2, z0}, .{x0 + ao_w, 0.2, z0}, .{x0 + ao_w, 0.2, z1}, .{x0, 0.2, z1}, ao_c);
+    }
+    if tile_is_solid(c + 1, r) {
+        draw_quad_3d(.{x1 - ao_w, 0.2, z0}, .{x1, 0.2, z0}, .{x1, 0.2, z1}, .{x1 - ao_w, 0.2, z1}, ao_c);
+    }
+
     seed := c * 131 + r * 977;
-    if (seed % 5) == 0 {
-        twinkle := 0.4 + (sin(cast(float)frame_count / 30.0 + cast(float)seed) + 1) * 0.25;
+    if (seed % 4) == 0 {
+        twinkle := 0.45 + (sin(cast(float)frame_count / 30.0 + cast(float)seed) + 1) * 0.30;
         offset_x := cast(float)(seed % 30) - 15;
         offset_z := cast(float)((seed / 7) % 30) - 15;
         cx_w := x0 + cast(float)TILE * 0.5 + offset_x;
         cz_w := z0 + cast(float)TILE * 0.5 + offset_z;
-        sc, _ := project(.{cx_w, 0.2, cz_w});
-        draw_filled_circle(sc.x, sc.y, 1.2, col(0.612, 0.502, 0.871, twinkle), 6);
+        sc, _ := project(.{cx_w, 0.3, cz_w});
+        draw_filled_circle(sc.x, sc.y, 1.5, col(0.706, 0.580, 0.961, twinkle), 6);
     }
 }
 
 draw_wall_3d :: (c: int, r: int) {
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
-    base := col(0.302, 0.282, 0.376, 1);
-    top  := col(0.404, 0.380, 0.502, 1);
+    base := col(0.314, 0.290, 0.408, 1);
+    top  := col(0.494, 0.463, 0.624, 1);
     draw_cube_3d(cx_w, cz_w, cast(float)TILE * 0.5, cast(float)TILE, top, base);
 
     edge_dark := col(0.173, 0.157, 0.251, 1);
@@ -384,21 +477,56 @@ draw_wall_3d :: (c: int, r: int) {
     tr := 1.5;
     draw_quad_3d(.{x0, h, z1}, .{x1, h, z1}, .{x1, h - tr, z1}, .{x0, h - tr, z1}, shade(edge_dark, 1));
     draw_quad_3d(.{x0, h, z0}, .{x0, h, z1}, .{x0, h - tr, z1}, .{x0, h - tr, z0}, shade(edge_dark, 1));
+
+    mortar    := col(0.149, 0.137, 0.224, 1);
+    highlight := col(0.612, 0.580, 0.745, 1);
+    mid_x := (x0 + x1) * 0.5;
+    mid_z := (z0 + z1) * 0.5;
+    mort_w :: 2.0;
+    draw_quad_3d(.{x0 + 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z + mort_w}, .{x0 + 6, h + 0.1, mid_z + mort_w}, mortar);
+    draw_quad_3d(.{mid_x - mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z1 - 6}, .{mid_x - mort_w, h + 0.1, z1 - 6}, mortar);
+    seed := c * 53 + r * 211;
+    dot_x := x0 + cast(float)(seed % 18) + 8;
+    dot_z := z0 + cast(float)((seed / 5) % 18) + 8;
+    draw_quad_3d(.{dot_x, h + 0.2, dot_z}, .{dot_x + 3, h + 0.2, dot_z}, .{dot_x + 3, h + 0.2, dot_z + 3}, .{dot_x, h + 0.2, dot_z + 3}, highlight);
 }
 
 draw_brick_3d :: (c: int, r: int) {
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
     h := cast(float)TILE * 0.72;
-    base := col(0.545, 0.431, 0.243, 1);
-    top  := col(0.667, 0.549, 0.341, 1);
+    base := col(0.580, 0.439, 0.227, 1);
+    top  := col(0.769, 0.620, 0.376, 1);
     draw_cube_3d(cx_w, cz_w, cast(float)TILE * 0.45, h, top, base);
 
+    half := cast(float)TILE * 0.45;
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    rim_dark := col(0.341, 0.231, 0.098, 1);
+    inner    := col(0.847, 0.694, 0.439, 1);
+    grain    := col(0.435, 0.314, 0.157, 1);
+    rim_w :: 2.5;
+    draw_quad_3d(.{x0, h + 0.1, z0}, .{x1, h + 0.1, z0}, .{x1, h + 0.1, z0 + rim_w}, .{x0, h + 0.1, z0 + rim_w}, rim_dark);
+    draw_quad_3d(.{x0, h + 0.1, z1 - rim_w}, .{x1, h + 0.1, z1 - rim_w}, .{x1, h + 0.1, z1}, .{x0, h + 0.1, z1}, rim_dark);
+    draw_quad_3d(.{x0, h + 0.1, z0}, .{x0 + rim_w, h + 0.1, z0}, .{x0 + rim_w, h + 0.1, z1}, .{x0, h + 0.1, z1}, rim_dark);
+    draw_quad_3d(.{x1 - rim_w, h + 0.1, z0}, .{x1, h + 0.1, z0}, .{x1, h + 0.1, z1}, .{x1 - rim_w, h + 0.1, z1}, rim_dark);
+
+    draw_quad_3d(.{x0 + 8, h + 0.15, z0 + 8}, .{x1 - 8, h + 0.15, z0 + 8}, .{x1 - 8, h + 0.15, z1 - 8}, .{x0 + 8, h + 0.15, z1 - 8}, inner);
+
     seed := c * 7 + r * 13;
+    for i: 0..2 {
+        gx0 := x0 + cast(float)((seed * (i + 1)) % 24) + 6;
+        gz  := z0 + cast(float)(((seed * 3) + i * 11) % 20) + 10;
+        draw_quad_3d(.{gx0, h + 0.2, gz}, .{gx0 + 8, h + 0.2, gz}, .{gx0 + 8, h + 0.2, gz + 1.2}, .{gx0, h + 0.2, gz + 1.2}, grain);
+    }
+
     offset := cast(float)((seed % 18) - 8);
-    x0 := cx_w - 14 + offset;
-    z_face := cz_w + cast(float)TILE * 0.45 + 0.5;
-    draw_quad_3d(.{x0, h * 0.4, z_face}, .{x0 + 10, h * 0.4, z_face}, .{x0 + 10, h * 0.4 + 4, z_face}, .{x0, h * 0.4 + 4, z_face}, col(0.353, 0.239, 0.102, 0.85));
+    bx := cx_w - 14 + offset;
+    z_face := cz_w + half + 0.5;
+    draw_quad_3d(.{bx, h * 0.4, z_face}, .{bx + 10, h * 0.4, z_face}, .{bx + 10, h * 0.4 + 4, z_face}, .{bx, h * 0.4 + 4, z_face}, col(0.353, 0.239, 0.102, 0.85));
 }
 
 draw_melting_brick_3d :: (m: MeltingBrick) {
@@ -473,7 +601,23 @@ draw_player_char :: (cx: float, cy: float) {
     }
 
     pupil_color := col(0.102, 0.137, 0.494, 1);
-    if d != .UP {
+    if player.stun_timer > 0 {
+        wob := sin(cast(float)frame_count / 4.0) * 1.4;
+        x_col := col(0.102, 0.137, 0.494, 1);
+        ex1 := cx - 5 + wob;
+        ex2 := cx + 4 + wob;
+        ey  := cyb - 5;
+        draw_line(ex1 - 3, ey - 3, ex1 + 3, ey + 3, x_col, 2);
+        draw_line(ex1 - 3, ey + 3, ex1 + 3, ey - 3, x_col, 2);
+        draw_line(ex2 - 3, ey - 3, ex2 + 3, ey + 3, x_col, 2);
+        draw_line(ex2 - 3, ey + 3, ex2 + 3, ey - 3, x_col, 2);
+        for i: 0..2 {
+            angle := (cast(float)i / 3.0) * TAU + cast(float)frame_count / 12.0;
+            sx := cx + cos(angle) * 14;
+            sy := cyb - 26 + sin(angle) * 4;
+            draw_filled_circle(sx, sy, 2.8, col(1, 0.922, 0.231, 1), 6);
+        }
+    } else if d != .UP {
         eye_shift: float;
         if d == .LEFT eye_shift = -1.5;
         else if d == .RIGHT eye_shift = 1.5;
@@ -502,6 +646,19 @@ draw_enemy_char :: (e: *Enemy, cx: float, cy: float) {
     bob := sin(cast(float)frame_count / 11.0 + cast(float)e.id) * 0.5;
     cyb := cy + bob;
 
+    fx: float = 0;
+    fy: float = 0;
+    if d == .LEFT       fx = -2;
+    else if d == .RIGHT fx = 2;
+    if d == .UP         fy = -1.5;
+
+    pdx: float = 0;
+    pdy: float = 0;
+    if d == .LEFT       pdx = -1.6;
+    else if d == .RIGHT pdx = 1.6;
+    if d == .UP         pdy = -1.5;
+    else if d == .DOWN  pdy = 1.0;
+
     robe_dark, robe_mid, skin: Vector4;
     if e.id == {
         case 1; // red demon
@@ -521,65 +678,133 @@ draw_enemy_char :: (e: *Enemy, cx: float, cy: float) {
     draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 22, 7, col(e.glow.x, e.glow.y, e.glow.z, 0.16));
     draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 2, 13, 4, col(0, 0, 0, 0.35));
 
+    // Robe is the body — stays fixed (doesn't pivot with head)
     draw_triangle(cx - 16, cyb + 22, cx - 8, cyb + 2, cx + 8, cyb + 2, robe_dark);
     draw_triangle(cx - 16, cyb + 22, cx + 8, cyb + 2, cx + 16, cyb + 22, robe_dark);
     draw_triangle(cx - 13, cyb + 20, cx - 6, cyb + 3, cx + 6, cyb + 3, robe_mid);
     draw_triangle(cx - 13, cyb + 20, cx + 6, cyb + 3, cx + 13, cyb + 20, robe_mid);
     draw_filled_rect(cx - 10, cyb + 10, 20, 3, robe_dark);
 
-    draw_filled_circle(cx - 1, cyb - 7, 11, skin, 14);
-    draw_filled_circle(cx + 2, cyb - 9, 4, col(1, 1, 1, 0.10), 8);
+    // Head pivots with facing
+    hx := cx + fx;
+    hy := cyb - 7 + fy;
+    draw_filled_circle(hx, hy, 11, skin, 14);
+    draw_filled_circle(hx + 3, hy - 2, 4, col(1, 1, 1, 0.10), 8);
 
     if e.id == 1 {
-        draw_triangle(cx - 9, cyb - 14, cx - 5, cyb - 14, cx - 12, cyb - 22, col(0.137, 0.039, 0.039, 1));
-        draw_triangle(cx + 5, cyb - 14, cx + 9, cyb - 14, cx + 12, cyb - 22, col(0.137, 0.039, 0.039, 1));
-        draw_triangle(cx - 11, cyb - 16, cx, cyb - 19, cx + 11, cyb - 16, col(0.137, 0.039, 0.039, 1));
+        hc := col(0.137, 0.039, 0.039, 1);
+        if d == .UP {
+            // Looking away — bigger horns visible on top of head
+            draw_triangle(hx - 10, hy - 5, hx - 6, hy - 5, hx - 13, hy - 16, hc);
+            draw_triangle(hx + 6, hy - 5, hx + 10, hy - 5, hx + 13, hy - 16, hc);
+            draw_triangle(hx - 12, hy - 8, hx, hy - 13, hx + 12, hy - 8, hc);
+        } else if d == .LEFT {
+            // Side-on horns — far horn smaller and tucked behind
+            draw_triangle(hx - 9, hy - 7, hx - 4, hy - 7, hx - 14, hy - 16, hc);
+            draw_triangle(hx + 4, hy - 7, hx + 7, hy - 7, hx + 7, hy - 13, hc);
+            draw_triangle(hx - 10, hy - 9, hx - 2, hy - 12, hx + 7, hy - 9, hc);
+        } else if d == .RIGHT {
+            draw_triangle(hx + 4, hy - 7, hx + 9, hy - 7, hx + 14, hy - 16, hc);
+            draw_triangle(hx - 7, hy - 7, hx - 4, hy - 7, hx - 7, hy - 13, hc);
+            draw_triangle(hx - 7, hy - 9, hx + 2, hy - 12, hx + 10, hy - 9, hc);
+        } else { // DOWN
+            draw_triangle(hx - 9, hy - 7, hx - 5, hy - 7, hx - 12, hy - 15, hc);
+            draw_triangle(hx + 5, hy - 7, hx + 9, hy - 7, hx + 12, hy - 15, hc);
+            draw_triangle(hx - 11, hy - 9, hx, hy - 12, hx + 11, hy - 9, hc);
+        }
     } else if e.id == 2 {
         hat_d := col(0.110, 0.027, 0.220, 1);
         hat_m := col(0.247, 0.078, 0.443, 1);
+        star  := col(0.918, 0.502, 0.988, 1);
         if d == .LEFT {
-            draw_filled_rect(cx - 14, cyb - 14, 26, 4, hat_d);
-            draw_triangle(cx + 12, cyb - 14, cx - 14, cyb - 14, cx - 16, cyb - 34, hat_m);
+            draw_filled_rect(hx - 14, hy - 7, 26, 4, hat_d);
+            draw_triangle(hx + 12, hy - 7, hx - 14, hy - 7, hx - 17, hy - 27, hat_m);
+            draw_filled_circle(hx - 17, hy - 27, 2.3, star, 8);
         } else if d == .RIGHT {
-            draw_filled_rect(cx - 12, cyb - 14, 26, 4, hat_d);
-            draw_triangle(cx - 12, cyb - 14, cx + 14, cyb - 14, cx + 16, cyb - 34, hat_m);
-        } else {
-            draw_filled_rect(cx - 13, cyb - 14, 26, 4, hat_d);
-            draw_triangle(cx - 13, cyb - 14, cx + 13, cyb - 14, cx, cyb - 36, hat_m);
-            draw_filled_circle(cx, cyb - 36, 2.2, col(0.918, 0.502, 0.988, 1), 8);
+            draw_filled_rect(hx - 12, hy - 7, 26, 4, hat_d);
+            draw_triangle(hx - 12, hy - 7, hx + 14, hy - 7, hx + 17, hy - 27, hat_m);
+            draw_filled_circle(hx + 17, hy - 27, 2.3, star, 8);
+        } else if d == .UP {
+            // Hat tilted back — wider brim visible from behind, short tip
+            draw_filled_rect(hx - 13, hy - 7, 26, 4, hat_d);
+            draw_triangle(hx - 11, hy - 7, hx + 11, hy - 7, hx, hy - 20, hat_d);
+            draw_filled_circle(hx, hy - 20, 2.0, star, 8);
+        } else { // DOWN
+            draw_filled_rect(hx - 13, hy - 7, 26, 4, hat_d);
+            draw_triangle(hx - 13, hy - 7, hx + 13, hy - 7, hx, hy - 29, hat_m);
+            draw_filled_circle(hx, hy - 29, 2.2, star, 8);
         }
     } else if e.id == 3 {
         hood_d := col(0.043, 0.149, 0.055, 1);
         hood_m := col(0.094, 0.282, 0.106, 1);
-        draw_triangle(cx - 15, cyb + 4, cx - 14, cyb - 16, cx, cyb - 18, hood_d);
-        draw_triangle(cx - 15, cyb + 4, cx, cyb - 18, cx + 15, cyb + 4, hood_d);
-        draw_triangle(cx + 15, cyb + 4, cx + 14, cyb - 16, cx, cyb - 18, hood_d);
-        draw_triangle(cx - 12, cyb + 2, cx - 11, cyb - 13, cx, cyb - 15, hood_m);
-        draw_triangle(cx + 12, cyb + 2, cx + 11, cyb - 13, cx, cyb - 15, hood_m);
-        draw_filled_circle(cx, cyb - 6, 9, col(0.157, 0.106, 0.157, 1), 12);
+        // Peak (back of the hood) swings opposite to facing
+        peak_x := hx;
+        peak_y := hy - 11;
+        if d == .LEFT       peak_x = hx + 3;
+        else if d == .RIGHT peak_x = hx - 3;
+        else if d == .UP    peak_y = hy - 6;
+        lbx := cx - 15; lby := cyb + 4;
+        rbx := cx + 15; rby := cyb + 4;
+        draw_triangle(lbx, lby, hx - 14, hy - 9, peak_x, peak_y, hood_d);
+        draw_triangle(lbx, lby, peak_x, peak_y, rbx, rby, hood_d);
+        draw_triangle(rbx, rby, hx + 14, hy - 9, peak_x, peak_y, hood_d);
+        draw_triangle(cx - 12, cyb + 2, hx - 11, hy - 6, peak_x, peak_y + 3, hood_m);
+        draw_triangle(cx + 12, cyb + 2, hx + 11, hy - 6, peak_x, peak_y + 3, hood_m);
+        // Face shadow under hood
+        draw_filled_circle(hx, hy + 1, 9, col(0.157, 0.106, 0.157, 1), 12);
     }
 
-    eye_y: float;
-    if d == .UP eye_y = cyb - 7; else eye_y = cyb - 5;
-    if e.id == 3 {
-        draw_filled_circle(cx - 5, eye_y, 2.5, e.glow, 8);
-        draw_filled_circle(cx + 5, eye_y, 2.5, e.glow, 8);
-        draw_filled_circle(cx - 5, eye_y, 1.4, col(1, 1, 1, 1), 6);
-        draw_filled_circle(cx + 5, eye_y, 1.4, col(1, 1, 1, 1), 6);
+    // Eyes
+    if e.stun_timer > 0 {
+        // Knocked out — X eyes, wobbling slightly
+        wob := sin(cast(float)frame_count / 4.0 + cast(float)e.id) * 1.4;
+        x_col := col(0.1, 0.06, 0.06, 1);
+        ex1 := hx - 5 + wob;
+        ex2 := hx + 5 + wob;
+        ey  := hy + 2;
+        draw_line(ex1 - 3, ey - 3, ex1 + 3, ey + 3, x_col, 2);
+        draw_line(ex1 - 3, ey + 3, ex1 + 3, ey - 3, x_col, 2);
+        draw_line(ex2 - 3, ey - 3, ex2 + 3, ey + 3, x_col, 2);
+        draw_line(ex2 - 3, ey + 3, ex2 + 3, ey - 3, x_col, 2);
+    } else if e.id == 3 {
+        ey := hy + 2;
+        if d == .UP {
+            // hood hides face — single glow visible
+            draw_filled_circle(hx, hy - 2, 2.2, e.glow, 8);
+            draw_filled_circle(hx, hy - 2, 1.0, col(1, 1, 1, 1), 6);
+        } else {
+            draw_filled_circle(hx - 4 + pdx * 0.7, ey + pdy * 0.7, 2.5, e.glow, 8);
+            draw_filled_circle(hx + 4 + pdx * 0.7, ey + pdy * 0.7, 2.5, e.glow, 8);
+            draw_filled_circle(hx - 4 + pdx * 0.7, ey + pdy * 0.7, 1.3, col(1, 1, 1, 1), 6);
+            draw_filled_circle(hx + 4 + pdx * 0.7, ey + pdy * 0.7, 1.3, col(1, 1, 1, 1), 6);
+        }
     } else {
-        draw_filled_circle(cx - 5, eye_y, 4.5, col(1, 1, 1, 1), 10);
-        draw_filled_circle(cx + 5, eye_y, 4.5, col(1, 1, 1, 1), 10);
-        draw_filled_circle(cx - 5, eye_y, 2.6, e.color, 8);
-        draw_filled_circle(cx + 5, eye_y, 2.6, e.color, 8);
-        draw_filled_circle(cx - 5, eye_y, 1.2, e.glow, 6);
-        draw_filled_circle(cx + 5, eye_y, 1.2, e.glow, 6);
-        draw_filled_circle(cx - 4, eye_y - 1, 0.7, col(1, 1, 1, 1), 4);
-        draw_filled_circle(cx + 6, eye_y - 1, 0.7, col(1, 1, 1, 1), 4);
+        if d == .UP {
+            // Looking up/away — just back of head, no eyes from this angle
+        } else {
+            ey := hy + 2;
+            draw_filled_circle(hx - 5, ey, 4.5, col(1, 1, 1, 1), 10);
+            draw_filled_circle(hx + 5, ey, 4.5, col(1, 1, 1, 1), 10);
+            draw_filled_circle(hx - 5 + pdx, ey + pdy, 2.6, e.color, 8);
+            draw_filled_circle(hx + 5 + pdx, ey + pdy, 2.6, e.color, 8);
+            draw_filled_circle(hx - 5 + pdx, ey + pdy, 1.2, e.glow, 6);
+            draw_filled_circle(hx + 5 + pdx, ey + pdy, 1.2, e.glow, 6);
+            draw_filled_circle(hx - 4 + pdx, ey + pdy - 1, 0.7, col(1, 1, 1, 1), 4);
+            draw_filled_circle(hx + 6 + pdx, ey + pdy - 1, 0.7, col(1, 1, 1, 1), 4);
+        }
     }
 
-    if e.id == 1 && d != .UP {
-        draw_triangle(cx - 2, cyb - 1, cx - 4, cyb + 2, cx - 1, cyb + 2, col(1, 1, 1, 0.9));
-        draw_triangle(cx + 2, cyb - 1, cx + 4, cyb + 2, cx + 1, cyb + 2, col(1, 1, 1, 0.9));
+    // Fangs — red demon only, facing forward/sideways, not while knocked out
+    if e.id == 1 && d != .UP && e.stun_timer == 0 {
+        fy_base := hy + 6;
+        if d == .LEFT {
+            draw_triangle(hx - 4, fy_base, hx - 6, fy_base + 3, hx - 3, fy_base + 3, col(1, 1, 1, 0.9));
+        } else if d == .RIGHT {
+            draw_triangle(hx + 4, fy_base, hx + 6, fy_base + 3, hx + 3, fy_base + 3, col(1, 1, 1, 0.9));
+        } else {
+            draw_triangle(hx - 2, fy_base, hx - 4, fy_base + 3, hx - 1, fy_base + 3, col(1, 1, 1, 0.9));
+            draw_triangle(hx + 2, fy_base, hx + 4, fy_base + 3, hx + 1, fy_base + 3, col(1, 1, 1, 0.9));
+        }
     }
 
     if e.stun_timer > 0 {
@@ -632,6 +857,91 @@ draw_explosion :: (e: Explosion, ex: float, ey: float) {
     }
 }
 
+draw_death_fx :: (fx: DeathFx, cx: float, cy: float) {
+    progress := 1.0 - cast(float)fx.timer / cast(float)fx.duration;
+    inv      := 1.0 - progress;
+    base_color := fx.color;
+
+    if fx.kind == .DUST {
+        // Subtle ground puff. Just a few small particles, no flash, no ring.
+        for k: 0..2 {
+            ang := cast(float)(k * 120 + 30) * PI / 180.0;
+            dist := 5.0 + progress * 6.0;
+            px := cx + cos(ang) * dist;
+            py := cy + sin(ang) * dist * 0.5;
+            sz := 1.6 * inv;
+            if sz > 0.3 draw_filled_circle(px, py, sz, .{base_color.x, base_color.y, base_color.z, inv * 0.55}, 5);
+        }
+        return;
+    }
+
+    if fx.kind == .BOING {
+        // Quick squashed shockwave on the ground. Implies impact.
+        ring_r := progress * 22.0;
+        a_ring := inv * 0.9;
+        segs := 18;
+        for j: 0..segs-1 {
+            ang := (cast(float)j / cast(float)segs) * TAU;
+            rx := cx + cos(ang) * ring_r;
+            ry := cy + sin(ang) * ring_r * 0.45;
+            draw_filled_circle(rx, ry, 1.6 + inv * 1.4, .{base_color.x, base_color.y, base_color.z, a_ring}, 6);
+        }
+        if progress < 0.35 {
+            a := (0.35 - progress) / 0.35;
+            draw_filled_circle(cx, cy, 8 * inv, .{1, 1, 1, a * 0.8}, 10);
+        }
+        return;
+    }
+
+    max_r       := ifx fx.kind == .BIG then 46.0 else 28.0;
+    flash_r     := ifx fx.kind == .BIG then 26.0 else 16.0;
+    particle_n  := ifx fx.kind == .BIG then 10 else 6;
+
+    ring_r := progress * max_r;
+    ring_thickness := 3.5 * inv + 1.0;
+    ring_alpha := inv * 0.85;
+    segs := 22;
+    for j: 0..segs-1 {
+        ang := (cast(float)j / cast(float)segs) * TAU;
+        rx := cx + cos(ang) * ring_r;
+        ry := cy + sin(ang) * ring_r * 0.55;
+        draw_filled_circle(rx, ry, ring_thickness, .{base_color.x, base_color.y, base_color.z, ring_alpha}, 6);
+    }
+
+    if progress < 0.45 {
+        a := (0.45 - progress) / 0.45;
+        rad := flash_r * (1.0 - progress * 1.6);
+        if rad > 0.5 {
+            draw_filled_circle(cx, cy, rad, .{1, 1, 1, a * 0.85}, 14);
+            draw_filled_circle(cx, cy, rad * 0.65, .{base_color.x, base_color.y, base_color.z, a}, 14);
+        }
+    }
+
+    for k: 0..particle_n-1 {
+        seed := cast(float)(k * 37 + cast(int)(fx.x * 53.0) + cast(int)(fx.y * 91.0));
+        ang := seed + progress * 1.3;
+        spd := 30.0 + (seed - cast(float)(cast(int)seed)) * 24.0;
+        dist := spd * progress;
+        px := cx + cos(ang) * dist;
+        py := cy + sin(ang) * dist * 0.65 - progress * 12.0;
+        sz := (2.4 + (seed - cast(float)(cast(int)seed)) * 1.6) * inv;
+        if sz > 0.3 {
+            draw_filled_circle(px, py, sz, .{base_color.x, base_color.y, base_color.z, inv * 0.85}, 5);
+            draw_filled_circle(px, py, sz * 0.55, .{1, 1, 1, inv * 0.6}, 5);
+        }
+    }
+
+    if fx.kind == .BIG {
+        for i: 0..7 {
+            ang := (cast(float)i / 8.0) * TAU;
+            len := max_r * 0.85 * progress;
+            x2 := cx + cos(ang) * len;
+            y2 := cy + sin(ang) * len * 0.55;
+            draw_line(cx, cy, x2, y2, .{1, 1, 1, inv * 0.45}, 1.5);
+        }
+    }
+}
+
 draw_powerup :: (p: Powerup, cx: float, cy: float) {
     if p.delay > 0 return;
     pulse := sin(cast(float)frame_count / 15.0) * 2;
@@ -658,6 +968,25 @@ draw_powerup :: (p: Powerup, cx: float, cy: float) {
                 sy := cy + bob - pulse + sin(angle) * 12;
                 draw_filled_circle(sx, sy, 2, col(1.0, 0.878, 0.510, 1), 4);
             }
+        case .SKATE;
+            yy := cy + bob - pulse;
+            wheel_c := col(0.137, 0.165, 0.255, 1);
+            boot_d  := col(0.298, 0.329, 0.451, 1);
+            boot_l  := col(0.490, 0.604, 0.749, 1);
+            draw_filled_rect(cx - 7, yy - 5, 14, 5, boot_d);
+            draw_filled_rect(cx + 1, yy - 11, 7, 6, boot_d);
+            draw_filled_rect(cx + 2, yy - 10, 5, 1, boot_l);
+            draw_filled_rect(cx - 6, yy - 4, 12, 1, boot_l);
+            draw_filled_circle(cx - 4, yy + 1, 2.5, wheel_c, 8);
+            draw_filled_circle(cx + 1, yy + 1, 2.5, wheel_c, 8);
+            draw_filled_circle(cx + 6, yy + 1, 2.5, wheel_c, 8);
+            // motion zaps behind the boot
+            for i: 0..1 {
+                a := col(0.420, 0.812, 1.0, 0.7 - cast(float)i * 0.25);
+                ox := -10.0 - cast(float)i * 4;
+                draw_triangle(cx + ox, yy - 6, cx + ox + 5, yy - 9, cx + ox + 4, yy - 6, a);
+                draw_triangle(cx + ox + 4, yy - 6, cx + ox + 8, yy - 2, cx + ox + 5, yy - 2, a);
+            }
     }
 }
 
@@ -683,6 +1012,10 @@ draw_melting_powerup :: (m: MeltingPowerup, cx: float, cy: float) {
             dark_c = col(0.365, 0.251, 0.216, pct);
             mid_c = col(1.0, 0.435, 0, pct);
             light_c = col(1.0, 0.671, 0.251, (1 - pct) * 0.5);
+        case .SKATE;
+            dark_c = col(0.137, 0.243, 0.420, pct);
+            mid_c = col(0.298, 0.541, 0.812, pct);
+            light_c = col(0.612, 0.851, 1.0, (1 - pct) * 0.5);
     }
 
     draw_filled_rect(cx - h/2, cy - h/2, h, h, dark_c);
@@ -691,6 +1024,7 @@ draw_melting_powerup :: (m: MeltingPowerup, cx: float, cy: float) {
 }
 
 place_bomb :: () {
+    if player.stun_timer > 0 return;
     active_player_bombs := 0;
     for bombs if it.owner == 0 active_player_bombs += 1;
     if active_player_bombs >= player.max_bombs return;
@@ -701,6 +1035,7 @@ place_bomb :: () {
     b.range = player.fire_range;
     b.owner = 0;
     array_add(*bombs, b);
+    spawn_death_fx(cast(float)b.x, cast(float)b.y, col(0.702, 0.533, 1.0, 1), false);
 }
 
 explode :: (b: Bomb) {
@@ -722,7 +1057,7 @@ explode :: (b: Bomb) {
 
             hit_bomb := false;
             for * bombs {
-                if it.x == nx && it.y == ny {
+                if !it.punching && it.x == nx && it.y == ny {
                     it.timer = 1;
                     it.chain = true;
                     hit_bomb = true;
@@ -743,6 +1078,7 @@ explode :: (b: Bomb) {
                 mp: MeltingPowerup;
                 mp.x = pu.x; mp.y = pu.y; mp.type = pu.type; mp.timer = POWERUP_MELT_DURATION;
                 array_add(*melting_powerups, mp);
+                spawn_death_fx(cast(float)pu.x, cast(float)pu.y, powerup_color(pu.type), false);
                 array_unordered_remove_by_index(*powerups, hit_powerup_idx);
                 ne: Explosion;
                 ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
@@ -755,13 +1091,21 @@ explode :: (b: Bomb) {
                 mb: MeltingBrick;
                 mb.x = nx; mb.y = ny; mb.timer = MELT_DURATION;
                 array_add(*melting_bricks, mb);
+                spawn_death_fx(cast(float)nx, cast(float)ny, col(0.702, 0.533, 1.0, 1), false);
 
                 if !b.chain && random_get_zero_to_one() < POWERUP_DROP_RATE {
                     r := random_get_zero_to_one();
                     ptype: PType;
-                    if r < 0.38 ptype = .BOMB;
-                    else if r < 0.76 ptype = .FIRE;
-                    else if r < 0.88 {
+                    if r < 0.30 ptype = .BOMB;
+                    else if r < 0.60 ptype = .FIRE;
+                    else if r < 0.80 {
+                        if skate_spawned < SKATE_MAX {
+                            ptype = .SKATE;
+                            skate_spawned += 1;
+                        } else {
+                            ptype = ifx random_get_zero_to_one() < 0.5 then PType.BOMB else PType.FIRE;
+                        }
+                    } else if r < 0.90 {
                         if kick_spawned < KICK_MAX {
                             ptype = .KICK;
                             kick_spawned += 1;
@@ -814,7 +1158,7 @@ is_in_blast :: (x: int, y: int, extra: [] Bomb = .[]) -> bool {
         return false;
     }
 
-    for bombs if check(it.x, it.y, it.range, x, y) return true;
+    for bombs { if !it.punching && check(it.x, it.y, it.range, x, y) return true; }
     for extra if check(it.x, it.y, it.range, x, y) return true;
     return false;
 }
@@ -822,11 +1166,11 @@ is_in_blast :: (x: int, y: int, extra: [] Bomb = .[]) -> bool {
 can_walk_safe :: (x: int, y: int) -> bool {
     if x < 0 || x >= COLS || y < 0 || y >= ROWS return false;
     if grid[y][x] != .EMPTY return false;
-    for bombs if it.x == x && it.y == y return false;
+    for bombs if !it.punching && it.x == x && it.y == y return false;
     return true;
 }
 
-bfs_path :: (sx: int, sy: int, tx: int, ty: int) -> [..] BFSNode {
+bfs_path :: (sx: int, sy: int, tx: int, ty: int, avoid_blast: bool = false) -> [..] BFSNode {
     path: [..] BFSNode;
     path.allocator = temp;
     if sx == tx && sy == ty return path;
@@ -856,10 +1200,9 @@ bfs_path :: (sx: int, sy: int, tx: int, ty: int) -> [..] BFSNode {
             ny := cur.y + DIRS[dir_idx * 2 + 1];
             if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS continue;
             if visited[ny][nx] continue;
-            if !(nx == tx && ny == ty) && !can_walk_safe(nx, ny) continue;
-            if nx == tx && ny == ty && grid[ny][nx] != .EMPTY {
-                // Allow ending on the target if it's only blocked by a bomb (we accept colliding)
-            }
+            is_target := (nx == tx && ny == ty);
+            if !is_target && !can_walk_safe(nx, ny) continue;
+            if !is_target && avoid_blast && is_in_blast(nx, ny) continue;
             visited[ny][nx] = true;
             parent[ny][nx] = cur;
             n: BFSNode;
@@ -963,83 +1306,100 @@ set_enemy_dir :: (e: *Enemy, dx: int, dy: int) {
     else if dx > 0 e.dir = .RIGHT;
 }
 
-enemy_needs_flee :: (e: *Enemy, extra: [] Bomb = .[]) -> bool {
-    if is_in_blast(e.x, e.y, extra) return true;
-    for bombs {
-        if it.owner == e.id && abs(e.x - it.x) + abs(e.y - it.y) <= it.range + 2 return true;
-    }
-    for extra {
-        if abs(e.x - it.x) + abs(e.y - it.y) <= it.range + 2 return true;
-    }
-    return false;
+enemy_step_to :: (e: *Enemy, nx: int, ny: int) {
+    e.last_x = e.x;
+    e.last_y = e.y;
+    set_enemy_dir(e, nx - e.x, ny - e.y);
+    e.x = nx;
+    e.y = ny;
+    e.idle_streak = 0;
+    spawn_fx(cast(float)e.last_x, cast(float)e.last_y, col(0.706, 0.671, 0.612, 1), .DUST);
 }
 
 enemy_do_flee_step :: (e: *Enemy) {
-    if e.has_flee && e.flee_x >= 0 && e.flee_y >= 0 && can_walk_safe(e.flee_x, e.flee_y) && !is_in_blast(e.flee_x, e.flee_y) {
+    // Keep the committed flee destination if it still looks safe.
+    if e.has_flee && e.flee_x >= 0 && e.flee_y >= 0
+        && can_walk_safe(e.flee_x, e.flee_y)
+        && !is_in_blast(e.flee_x, e.flee_y) {
         path := bfs_path(e.x, e.y, e.flee_x, e.flee_y);
         if path.count > 0 {
-            set_enemy_dir(e, path[0].x - e.x, path[0].y - e.y);
-            e.x = path[0].x; e.y = path[0].y;
+            enemy_step_to(e, path[0].x, path[0].y);
             return;
         }
     }
+
+    // Find a fresh safe haven.
     found, sx, sy := find_safe_cell(e.x, e.y);
     if found {
         e.flee_x = sx;
         e.flee_y = sy;
         e.has_flee = true;
+        if sx == e.x && sy == e.y return;  // already safe; just stay
         path := bfs_path(e.x, e.y, sx, sy);
         if path.count > 0 {
-            set_enemy_dir(e, path[0].x - e.x, path[0].y - e.y);
-            e.x = path[0].x; e.y = path[0].y;
+            enemy_step_to(e, path[0].x, path[0].y);
             return;
         }
     }
+
+    // Trapped — step toward whatever adjacent tile is least dangerous.
+    // Prefer: walkable AND not in blast, then walkable.
     best_dir_idx := -1;
-    best_dist := -1;
+    best_score := -1;
     for dir_idx: 0..3 {
         nx := e.x + DIRS[dir_idx * 2];
         ny := e.y + DIRS[dir_idx * 2 + 1];
         if !can_walk_safe(nx, ny) continue;
-        min_bomb_dist := 999999;
+        score := 0;
+        if !is_in_blast(nx, ny) score += 100;
+        if !(nx == e.last_x && ny == e.last_y) score += 5;
+        // tiebreak: farther from nearest bomb is better
+        nearest := 999;
         for bombs {
-            bd := abs(nx - it.x) + abs(ny - it.y);
-            if bd < min_bomb_dist min_bomb_dist = bd;
+            d := abs(nx - it.x) + abs(ny - it.y);
+            if d < nearest nearest = d;
         }
-        if min_bomb_dist > best_dist {
-            best_dist = min_bomb_dist;
+        score += nearest;
+        if score > best_score {
+            best_score = score;
             best_dir_idx = dir_idx;
         }
     }
     if best_dir_idx >= 0 {
         dx := DIRS[best_dir_idx * 2];
         dy := DIRS[best_dir_idx * 2 + 1];
-        set_enemy_dir(e, dx, dy);
-        e.x += dx;
-        e.y += dy;
+        enemy_step_to(e, e.x + dx, e.y + dy);
     }
 }
 
 enemy_move_random_safe :: (e: *Enemy) {
-    safe_dir_idx: [4] int;
-    safe_count := 0;
+    // Wander without immediate backtracking and without stepping into blast.
+    pref: [4] int;     // safe, not-backtrack
+    pref_n := 0;
+    alt: [4] int;      // safe, backtrack allowed
+    alt_n := 0;
     for dir_idx: 0..3 {
         nx := e.x + DIRS[dir_idx * 2];
         ny := e.y + DIRS[dir_idx * 2 + 1];
-        if can_walk_safe(nx, ny) && !is_in_blast(nx, ny) {
-            safe_dir_idx[safe_count] = dir_idx;
-            safe_count += 1;
+        if !can_walk_safe(nx, ny) || is_in_blast(nx, ny) continue;
+        if nx == e.last_x && ny == e.last_y {
+            alt[alt_n] = dir_idx;
+            alt_n += 1;
+        } else {
+            pref[pref_n] = dir_idx;
+            pref_n += 1;
         }
     }
-    if safe_count > 0 {
-        pick := cast(int)(random_get() % cast(u64) safe_count);
-        idx := safe_dir_idx[pick];
-        dx := DIRS[idx * 2];
-        dy := DIRS[idx * 2 + 1];
-        set_enemy_dir(e, dx, dy);
-        e.x += dx;
-        e.y += dy;
+    list_n := ifx pref_n > 0 then pref_n else alt_n;
+    if list_n == 0 {
+        e.idle_streak += 1;
+        return;
     }
+    pick := cast(int)(random_get() % cast(u64) list_n);
+    idx := ifx pref_n > 0 then pref[pick] else alt[pick];
+    dx := DIRS[idx * 2];
+    dy := DIRS[idx * 2 + 1];
+    enemy_step_to(e, e.x + dx, e.y + dy);
 }
 
 enemy_try_place_bomb :: (e: *Enemy, active_bombs: int, max_escape_steps: int) -> bool {
@@ -1054,6 +1414,7 @@ enemy_try_place_bomb :: (e: *Enemy, active_bombs: int, max_escape_steps: int) ->
     b: Bomb;
     b.x = e.x; b.y = e.y; b.timer = BOMB_TIMER; b.range = e.fire_range; b.owner = e.id;
     array_add(*bombs, b);
+    spawn_death_fx(cast(float)b.x, cast(float)b.y, col(0.702, 0.533, 1.0, 1), false);
     return true;
 }
 
@@ -1065,71 +1426,70 @@ update_single_enemy :: (e: *Enemy) {
     }
     e.move_timer -= 1;
     if e.move_timer > 0 return;
-    e.move_timer = ENEMY_MOVE_DELAY;
+    e.move_timer = e.move_delay;
 
-    max_escape_steps := BOMB_TIMER / ENEMY_MOVE_DELAY - 2;
+    max_escape_steps := BOMB_TIMER / e.move_delay - 2;
 
-    if enemy_needs_flee(e) {
+    // PHASE 1 — In immediate danger? Commit to a flee destination.
+    if is_in_blast(e.x, e.y) {
         enemy_do_flee_step(e);
         return;
     }
 
-    e.has_flee = false;
-    near_own_bomb := false;
-    for bombs {
-        if it.owner == e.id && abs(e.x - it.x) + abs(e.y - it.y) <= it.range + 2 {
-            near_own_bomb = true;
-            break;
-        }
-    }
-    if near_own_bomb {
-        enemy_do_flee_step(e);
-        return;
-    }
+    // Safe tile. Drop any stale flee plan.
+    if e.has_flee && e.x == e.flee_x && e.y == e.flee_y e.has_flee = false;
+    if e.has_flee && is_in_blast(e.flee_x, e.flee_y) e.has_flee = false;
 
     active_bombs := 0;
     for bombs if it.owner == e.id active_bombs += 1;
 
     has_target, tx, ty := find_nearest_target(e);
 
-    if !has_target {
-        enemy_move_random_safe(e);
-        return;
-    }
-
-    path := bfs_path(e.x, e.y, tx, ty);
-
-    if path.count > 0 {
-        next_step := path[0];
-        if is_in_blast(next_step.x, next_step.y) {
-            enemy_move_random_safe(e);
-            return;
-        }
-        set_enemy_dir(e, next_step.x - e.x, next_step.y - e.y);
-        e.x = next_step.x; e.y = next_step.y;
-        dist := abs(e.x - tx) + abs(e.y - ty);
-        if dist <= e.fire_range && dist > 0 && active_bombs < e.max_bombs {
-            enemy_try_place_bomb(e, active_bombs, max_escape_steps);
-        }
-    } else {
-        has_adj_brick := false;
-        for dir_idx: 0..3 {
-            nx := e.x + DIRS[dir_idx * 2];
-            ny := e.y + DIRS[dir_idx * 2 + 1];
-            if nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS && grid[ny][nx] == .BRICK {
-                has_adj_brick = true;
-                break;
+    // PHASE 2 — Pursue, but never step into a blast.
+    if has_target {
+        path := bfs_path(e.x, e.y, tx, ty, avoid_blast = true);
+        if path.count > 0 {
+            ns := path[0];
+            // BFS already avoided blast, but double-check + don't immediately U-turn unless target is right there.
+            if !is_in_blast(ns.x, ns.y) {
+                if ns.x == e.last_x && ns.y == e.last_y && path.count > 1 {
+                    // Skip backtrack only if a better-progress alternative exists.
+                    alt := bfs_path(e.x, e.y, tx, ty, avoid_blast = true);
+                    if alt.count > 0 && !(alt[0].x == e.last_x && alt[0].y == e.last_y) ns = alt[0];
+                }
+                enemy_step_to(e, ns.x, ns.y);
+                dist := abs(e.x - tx) + abs(e.y - ty);
+                if dist <= e.fire_range && dist > 0 && active_bombs < e.max_bombs {
+                    enemy_try_place_bomb(e, active_bombs, max_escape_steps);
+                }
+                return;
             }
         }
-        if has_adj_brick {
-            enemy_try_place_bomb(e, active_bombs, max_escape_steps);
-        } else {
-            enemy_move_random_safe(e);
+    }
+
+    // PHASE 3 — No safe path. Try opportunistic brick-busting if we can do it safely.
+    has_adj_brick := false;
+    for dir_idx: 0..3 {
+        nx := e.x + DIRS[dir_idx * 2];
+        ny := e.y + DIRS[dir_idx * 2 + 1];
+        if nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS && grid[ny][nx] == .BRICK {
+            has_adj_brick = true;
+            break;
         }
+    }
+    if has_adj_brick && active_bombs < e.max_bombs {
+        if enemy_try_place_bomb(e, active_bombs, max_escape_steps) return;
+    }
+
+    // PHASE 4 — Idle. Stay put unless we've been still for a while (avoid frozen look).
+    e.idle_streak += 1;
+    if e.idle_streak > 5 {
+        enemy_move_random_safe(e);
     }
 }
 
 move_player :: (dx: int, dy: int) {
+    if player.stun_timer > 0 return;
     nx := player.x + dx;
     ny := player.y + dy;
     if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS return;
@@ -1137,7 +1497,7 @@ move_player :: (dx: int, dy: int) {
 
     bomb_idx := -1;
     for bombs {
-        if it.x == nx && it.y == ny {
+        if !it.punching && it.x == nx && it.y == ny {
             bomb_idx = it_index;
             break;
         }
@@ -1150,8 +1510,10 @@ move_player :: (dx: int, dy: int) {
             sy := ny + dy;
             if sx >= 0 && sx < COLS && sy >= 0 && sy < ROWS && grid[sy][sx] == .EMPTY {
                 blocked := false;
-                for bombs if it_index != bomb_idx && it.x == sx && it.y == sy blocked = true;
+                for bombs if !it.punching && it_index != bomb_idx && it.x == sx && it.y == sy blocked = true;
                 if !blocked {
+                    prev_x := player.x;
+                    prev_y := player.y;
                     b.x = sx;
                     b.y = sy;
                     b.slide_dx = dx;
@@ -1159,18 +1521,23 @@ move_player :: (dx: int, dy: int) {
                     b.slide_timer = BOMB_SLIDE_SPEED;
                     player.x = nx;
                     player.y = ny;
+                    spawn_fx(cast(float)prev_x, cast(float)prev_y, col(0.706, 0.671, 0.612, 1), .DUST);
                 }
             }
         }
         return;
     }
 
+    prev_x := player.x;
+    prev_y := player.y;
     player.x = nx;
     player.y = ny;
+    spawn_fx(cast(float)prev_x, cast(float)prev_y, col(0.706, 0.671, 0.612, 1), .DUST);
 }
 
 punch_bomb :: () {
     if !player.has_punch return;
+    if player.stun_timer > 0 return;
     ddx, ddy: int;
     if player.dir == {
         case .UP;    ddx = 0; ddy = -1;
@@ -1184,7 +1551,7 @@ punch_bomb :: () {
 
     bomb_idx := -1;
     for bombs {
-        if it.x == bx && it.y == by && it.slide_dx == 0 && it.slide_dy == 0 {
+        if !it.punching && it.slide_dx == 0 && it.slide_dy == 0 && it.x == bx && it.y == by {
             bomb_idx = it_index;
             break;
         }
@@ -1192,38 +1559,20 @@ punch_bomb :: () {
     if bomb_idx < 0 return;
     b := *bombs[bomb_idx];
 
-    tx := b.x + ddx * 2;
-    ty := b.y + ddy * 2;
-    if tx >= 0 && tx < COLS && ty >= 0 && ty < ROWS && grid[ty][tx] == .EMPTY {
-        blocked := false;
-        for bombs if it_index != bomb_idx && it.x == tx && it.y == ty blocked = true;
-        if !blocked {
-            for * enemies {
-                if it.alive && it.x == tx && it.y == ty it.stun_timer = STUN_DURATION;
-            }
-            b.x = tx; b.y = ty;
-            return;
-        }
-    }
-
-    MAX_DIM :: 15;
-    for i: 1..MAX_DIM {
-        cx := tx - ddx * i;
-        cy := ty - ddy * i;
-        if cx < 0 || cx >= COLS || cy < 0 || cy >= ROWS break;
-        if grid[cy][cx] == .WALL || grid[cy][cx] == .BRICK || grid[cy][cx] == .BRICK_MELTING break;
-        if grid[cy][cx] == .EMPTY {
-            blocked2 := false;
-            for bombs if it_index != bomb_idx && it.x == cx && it.y == cy blocked2 = true;
-            if !blocked2 {
-                for * enemies {
-                    if it.alive && it.x == cx && it.y == cy it.stun_timer = STUN_DURATION;
-                }
-                b.x = cx; b.y = cy;
-                return;
-            }
-        }
-    }
+    // Kick off the first 2-tile hop. Bomb leaves the ground.
+    b.punching = true;
+    b.punch_dx = ddx;
+    b.punch_dy = ddy;
+    b.punch_from_x = cast(float)b.x;
+    b.punch_from_y = cast(float)b.y;
+    b.punch_target_x = cast(float)b.x + 2.0 * cast(float)ddx;
+    b.punch_target_y = cast(float)b.y + 2.0 * cast(float)ddy;
+    b.punch_t = 0;
+    // Liftoff puff
+    spawn_fx(cast(float)b.x, cast(float)b.y, col(0.882, 0.745, 0.906, 1), .BOING);
+    // While in flight, the ground tile is unoccupied. Mark x,y at -1 so other systems ignore the bomb.
+    b.x = -1;
+    b.y = -1;
 }
 
 update :: () {
@@ -1243,25 +1592,101 @@ update :: () {
         if abs(cast(float)it.y - it.ry) < 0.01 it.ry = cast(float)it.y;
     }
 
+    if player.stun_timer > 0 player.stun_timer -= 1;
+
     move_timer -= 1;
     if move_timer <= 0 {
         moved := false;
-        if key_up { move_player(0, -1); moved = true; player.dir = .UP; }
-        else if key_down { move_player(0, 1); moved = true; player.dir = .DOWN; }
-        else if key_left { move_player(-1, 0); moved = true; player.dir = .LEFT; }
-        else if key_right { move_player(1, 0); moved = true; player.dir = .RIGHT; }
-        if moved move_timer = PLAYER_MOVE_DELAY;
+        if player.stun_timer == 0 {
+            if key_up { move_player(0, -1); moved = true; player.dir = .UP; }
+            else if key_down { move_player(0, 1); moved = true; player.dir = .DOWN; }
+            else if key_left { move_player(-1, 0); moved = true; player.dir = .LEFT; }
+            else if key_right { move_player(1, 0); moved = true; player.dir = .RIGHT; }
+        }
+        if moved move_timer = player.move_delay;
+    }
+
+    // Advance punching bombs (arc-hop chain)
+    for * b, bi: bombs {
+        if !b.punching continue;
+        b.punch_t += 1.0 / cast(float)PUNCH_HOP_FRAMES;
+        while b.punching && b.punch_t >= 1.0 {
+            // Wrap the destination tile back into the grid.
+            tx := cast(int)(floor(b.punch_target_x) + cast(float)(COLS * 100)) % COLS;
+            ty := cast(int)(floor(b.punch_target_y) + cast(float)(ROWS * 100)) % ROWS;
+
+            spawn_fx(cast(float)tx, cast(float)ty, col(0.882, 0.745, 0.906, 1), .BOING);
+
+            should_land := true;
+            tile := grid[ty][tx];
+
+            if tile == .WALL || tile == .BRICK || tile == .BRICK_MELTING {
+                should_land = false;
+            } else {
+                if player.x == tx && player.y == ty {
+                    player.stun_timer = PLAYER_STUN;
+                    should_land = false;
+                }
+                for * en: enemies {
+                    if en.alive && en.x == tx && en.y == ty {
+                        en.stun_timer = PLAYER_STUN;
+                        should_land = false;
+                    }
+                }
+                for j: 0..bombs.count-1 {
+                    if j == bi continue;
+                    if !bombs[j].punching && bombs[j].x == tx && bombs[j].y == ty {
+                        should_land = false;
+                        break;
+                    }
+                }
+
+                if should_land {
+                    pidx := -1;
+                    for pup, pi: powerups {
+                        if pup.x == tx && pup.y == ty && pup.delay <= 0 {
+                            pidx = pi;
+                            break;
+                        }
+                    }
+                    if pidx >= 0 {
+                        pu := powerups[pidx];
+                        mp: MeltingPowerup;
+                        mp.x = pu.x; mp.y = pu.y; mp.type = pu.type; mp.timer = POWERUP_MELT_DURATION;
+                        array_add(*melting_powerups, mp);
+                        spawn_death_fx(cast(float)pu.x, cast(float)pu.y, powerup_color(pu.type), false);
+                        array_unordered_remove_by_index(*powerups, pidx);
+                    }
+                }
+            }
+
+            if should_land {
+                b.x = tx;
+                b.y = ty;
+                b.punching = false;
+                b.punch_t = 0;
+            } else {
+                // Initial hop was 2 tiles; bounces over obstacles are 1 tile each.
+                b.punch_from_x = cast(float)tx;
+                b.punch_from_y = cast(float)ty;
+                b.punch_target_x = cast(float)tx + cast(float)b.punch_dx;
+                b.punch_target_y = cast(float)ty + cast(float)b.punch_dy;
+                b.punch_t -= 1.0;
+            }
+        }
     }
 
     // Update bomb timers and trigger explosions
     {
         i := bombs.count - 1;
         while i >= 0 {
-            bombs[i].timer -= 1;
-            if bombs[i].timer <= 0 {
-                b := bombs[i];
-                array_unordered_remove_by_index(*bombs, i);
-                explode(b);
+            if !bombs[i].punching {
+                bombs[i].timer -= 1;
+                if bombs[i].timer <= 0 {
+                    b := bombs[i];
+                    array_unordered_remove_by_index(*bombs, i);
+                    explode(b);
+                }
             }
             i -= 1;
         }
@@ -1287,6 +1712,7 @@ update :: () {
                     }
                 }
                 if !blocked {
+                    spawn_fx(cast(float)it.x, cast(float)it.y, col(0.612, 0.502, 0.871, 1), .DUST);
                     it.x = snx;
                     it.y = sny;
                 } else {
@@ -1336,20 +1762,46 @@ update :: () {
 
     // Hit by explosions
     for explosions_list {
-        if it.x == player.x && it.y == player.y {
-            game_over = true;
+        if game_over_delay == 0 && it.x == player.x && it.y == player.y {
+            spawn_death_fx(player.rx, player.ry, col(0.353, 0.604, 0.965, 1), true);
+            game_over_delay = 50;
+            hit_flash_timer = 22;
             player_won = false;
         }
         for * en: enemies {
-            if en.alive && it.x == en.x && it.y == en.y en.alive = false;
+            if en.alive && it.x == en.x && it.y == en.y {
+                en.alive = false;
+                spawn_death_fx(en.rx, en.ry, en.glow, true);
+            }
         }
     }
 
-    all_dead := true;
-    for enemies if it.alive { all_dead = false; break; }
-    if all_dead {
-        game_over = true;
-        player_won = true;
+    if game_over_delay > 0 {
+        game_over_delay -= 1;
+        if game_over_delay == 0 game_over = true;
+    }
+
+    if !game_over && game_over_delay == 0 {
+        all_dead := true;
+        for enemies if it.alive { all_dead = false; break; }
+        if all_dead {
+            game_over_delay = 50;
+            victory_flash_timer = 30;
+            player_won = true;
+        }
+    }
+
+    if hit_flash_timer > 0 hit_flash_timer -= 1;
+    if victory_flash_timer > 0 victory_flash_timer -= 1;
+
+    // Tick death FX
+    {
+        i := death_fx_list.count - 1;
+        while i >= 0 {
+            death_fx_list[i].timer -= 1;
+            if death_fx_list[i].timer <= 0 array_unordered_remove_by_index(*death_fx_list, i);
+            i -= 1;
+        }
     }
 
     // Powerups pickup / explosion damage
@@ -1368,6 +1820,7 @@ update :: () {
                 mp: MeltingPowerup;
                 mp.x = p.x; mp.y = p.y; mp.type = p.type; mp.timer = POWERUP_MELT_DURATION;
                 array_add(*melting_powerups, mp);
+                spawn_death_fx(cast(float)p.x, cast(float)p.y, powerup_color(p.type), false);
                 array_unordered_remove_by_index(*powerups, i);
                 i -= 1;
                 continue;
@@ -1377,6 +1830,11 @@ update :: () {
                 else if p.type == .FIRE player.fire_range += 1;
                 else if p.type == .KICK player.has_kick = true;
                 else if p.type == .PUNCH player.has_punch = true;
+                else if p.type == .SKATE {
+                    player.skate_count += 1;
+                    player.move_delay = max(PLAYER_MOVE_DELAY_MIN, player.move_delay - SKATE_BOOST_PLAYER);
+                }
+                spawn_death_fx(cast(float)p.x, cast(float)p.y, powerup_color(p.type), false);
                 array_unordered_remove_by_index(*powerups, i);
                 i -= 1;
                 continue;
@@ -1386,6 +1844,11 @@ update :: () {
                 if en.alive && p.x == en.x && p.y == en.y {
                     if p.type == .BOMB en.max_bombs += 1;
                     else if p.type == .FIRE en.fire_range += 1;
+                    else if p.type == .SKATE {
+                        en.skate_count += 1;
+                        en.move_delay = max(ENEMY_MOVE_DELAY_MIN, en.move_delay - SKATE_BOOST_ENEMY);
+                    }
+                    spawn_death_fx(cast(float)p.x, cast(float)p.y, powerup_color(p.type), false);
                     picked = true;
                     break;
                 }
@@ -1403,7 +1866,7 @@ draw_text :: (text: string, x: int, y: int, color: Vector4) {
 }
 
 draw_hud :: () {
-    bx := 8.0; by := 8.0; bw := 280.0; bh := 40.0;
+    bx := 8.0; by := 8.0; bw := 320.0; bh := 40.0;
     draw_rounded_rect(bx, by, bw, bh, 8, col(0.078, 0.063, 0.141, 0.85));
 
     ty := by + bh / 2 - 7;
@@ -1415,13 +1878,23 @@ draw_hud :: () {
     draw_filled_circle(bx + 55, by + bh / 2, 6, col(1.0, 0.671, 0.251, 1), 8);
     draw_text(tprint("%", player.fire_range), cast(int)(bx + 68), cast(int) ty, col(1.0, 0.878, 0.706, 1));
 
+    // Skate icon (boot+wheels miniature)
+    sx_hud := bx + 95;
+    sy_hud := by + bh / 2;
+    draw_filled_rect(sx_hud - 5, sy_hud - 2, 10, 4, col(0.298, 0.329, 0.451, 1));
+    draw_filled_rect(sx_hud + 0, sy_hud - 6, 5, 4, col(0.298, 0.329, 0.451, 1));
+    draw_filled_circle(sx_hud - 3, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
+    draw_filled_circle(sx_hud + 1, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
+    draw_filled_circle(sx_hud + 5, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
+    draw_text(tprint("%", player.skate_count), cast(int)(bx + 108), cast(int) ty, col(0.612, 0.851, 1.0, 1));
+
     if player.has_kick {
-        draw_filled_circle(bx + 105, by + bh / 2, 6, col(0, 0.737, 0.827, 1), 8);
-        draw_text("KICK", cast(int)(bx + 115), cast(int) ty, col(0.698, 0.922, 0.949, 1));
+        draw_filled_circle(bx + 145, by + bh / 2, 6, col(0, 0.737, 0.827, 1), 8);
+        draw_text("KICK", cast(int)(bx + 155), cast(int) ty, col(0.698, 0.922, 0.949, 1));
     }
 
     if player.has_punch {
-        px_hud := ifx player.has_kick then bx + 170 else bx + 105;
+        px_hud := ifx player.has_kick then bx + 210 else bx + 145;
         draw_filled_circle(px_hud, by + bh / 2, 6, col(1.0, 0.757, 0.027, 1), 8);
         draw_text("PNCH", cast(int)(px_hud + 10), cast(int) ty, col(1.0, 0.976, 0.769, 1));
     }
@@ -1493,10 +1966,30 @@ render :: () {
             draw_melting_powerup(it, sc.x, sc.y);
         }
         for bombs {
-            if it.y != r continue;
+            if it.punching || it.y != r continue;
             cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
             cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
             sc, _ := project(.{cx_w, cast(float)TILE * 0.3, cz_w});
+            draw_bomb(it, sc.x, sc.y);
+        }
+
+        // Punching bombs: render at interpolated row, with an arc + ground shadow.
+        for bombs {
+            if !it.punching continue;
+            ix := it.punch_from_x + (it.punch_target_x - it.punch_from_x) * it.punch_t;
+            iy := it.punch_from_y + (it.punch_target_y - it.punch_from_y) * it.punch_t;
+            wx := ix - floor(ix / cast(float)COLS) * cast(float)COLS;
+            wy := iy - floor(iy / cast(float)ROWS) * cast(float)ROWS;
+            if cast(int)wy != r continue;
+            cx_w := wx * cast(float)TILE + cast(float)TILE * 0.5;
+            cz_w := wy * cast(float)TILE + cast(float)TILE * 0.5;
+            arc_h := sin(it.punch_t * PI) * PUNCH_ARC_HEIGHT;
+            // Ground shadow: small flattened ellipse, smaller and dimmer at apex
+            sh_scale := 0.55 + (1.0 - sin(it.punch_t * PI)) * 0.45;
+            sh, _ := project(.{cx_w, 0.2, cz_w});
+            draw_filled_ellipse(sh.x, sh.y, 11.0 * sh_scale, 4.0 * sh_scale, col(0, 0, 0, 0.35 * sh_scale));
+            // Airborne bomb sprite
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.3 + arc_h, cz_w});
             draw_bomb(it, sc.x, sc.y);
         }
 
@@ -1521,6 +2014,43 @@ render :: () {
             sc, _ := project(.{cx_w, cast(float)TILE * 0.35, cz_w});
             draw_explosion(it, sc.x, sc.y);
         }
+
+        for death_fx_list {
+            row := cast(int)(it.y + 0.5);
+            if row != r continue;
+            cx_w := it.x * cast(float)TILE + cast(float)TILE * 0.5;
+            cz_w := it.y * cast(float)TILE + cast(float)TILE * 0.5;
+            h: float = 0.25 * cast(float)TILE;
+            if it.kind == {
+                case .BIG;      h = 0.40 * cast(float)TILE;
+                case .SMALL;    h = 0.25 * cast(float)TILE;
+                case .BOING;    h = 0.10 * cast(float)TILE;
+                case .DUST;     h = 0.05 * cast(float)TILE;
+            }
+            sc, _ := project(.{cx_w, h, cz_w});
+            draw_death_fx(it, sc.x, sc.y);
+        }
+    }
+
+    vw := cast(float)WINDOW_W;
+    vh := cast(float)WINDOW_H;
+    vig := col(0, 0, 0, 0.32);
+    band :: 90.0;
+    draw_filled_rect(0, 0,            vw,   band,       vig);
+    draw_filled_rect(0, vh - band,    vw,   band,       vig);
+    draw_filled_rect(0, 0,            band, vh,         vig);
+    draw_filled_rect(vw - band, 0,    band, vh,         vig);
+    vig2 := col(0, 0, 0, 0.22);
+    draw_filled_rect(0, 0,            vw,   band * 0.5, vig2);
+    draw_filled_rect(0, vh - band*0.5, vw,  band * 0.5, vig2);
+
+    if hit_flash_timer > 0 {
+        a := cast(float)hit_flash_timer / 22.0;
+        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.180, 0.180, a * 0.35));
+    }
+    if victory_flash_timer > 0 {
+        a := cast(float)victory_flash_timer / 30.0;
+        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.937, 0.541, a * 0.28));
     }
 
     Simp.immediate_flush();
@@ -1563,6 +2093,9 @@ reset_state :: () {
     player.x = 1; player.y = 1; player.rx = 1; player.ry = 1;
     player.max_bombs = START_MAX_BOMBS; player.fire_range = START_FIRE_RANGE;
     player.dir = .DOWN; player.has_kick = false; player.has_punch = false;
+    player.stun_timer = 0;
+    player.move_delay = PLAYER_MOVE_DELAY;
+    player.skate_count = 0;
 
     enemies[0].x = COLS - 2; enemies[0].y = ROWS - 2;
     enemies[0].rx = cast(float)(COLS - 2); enemies[0].ry = cast(float)(ROWS - 2);
@@ -1572,6 +2105,8 @@ reset_state :: () {
     enemies[0].glow = col(1.0, 0.090, 0.267, 1);
     enemies[0].id = 1; enemies[0].dir = .LEFT; enemies[0].stun_timer = 0;
     enemies[0].flee_x = -1; enemies[0].flee_y = -1; enemies[0].has_flee = false;
+    enemies[0].last_x = -1; enemies[0].last_y = -1; enemies[0].idle_streak = 0;
+    enemies[0].move_delay = ENEMY_MOVE_DELAY; enemies[0].skate_count = 0;
 
     enemies[1].x = COLS - 2; enemies[1].y = 1;
     enemies[1].rx = cast(float)(COLS - 2); enemies[1].ry = 1;
@@ -1581,6 +2116,8 @@ reset_state :: () {
     enemies[1].glow = col(0.918, 0.502, 0.988, 1);
     enemies[1].id = 2; enemies[1].dir = .DOWN; enemies[1].stun_timer = 0;
     enemies[1].flee_x = -1; enemies[1].flee_y = -1; enemies[1].has_flee = false;
+    enemies[1].last_x = -1; enemies[1].last_y = -1; enemies[1].idle_streak = 0;
+    enemies[1].move_delay = ENEMY_MOVE_DELAY; enemies[1].skate_count = 0;
 
     enemies[2].x = 1; enemies[2].y = ROWS - 2;
     enemies[2].rx = 1; enemies[2].ry = cast(float)(ROWS - 2);
@@ -1590,14 +2127,21 @@ reset_state :: () {
     enemies[2].glow = col(0.412, 0.941, 0.678, 1);
     enemies[2].id = 3; enemies[2].dir = .RIGHT; enemies[2].stun_timer = 0;
     enemies[2].flee_x = -1; enemies[2].flee_y = -1; enemies[2].has_flee = false;
+    enemies[2].last_x = -1; enemies[2].last_y = -1; enemies[2].idle_streak = 0;
+    enemies[2].move_delay = ENEMY_MOVE_DELAY; enemies[2].skate_count = 0;
 
     array_reset(*bombs);
     array_reset(*explosions_list);
     array_reset(*powerups);
     array_reset(*melting_bricks);
     array_reset(*melting_powerups);
+    array_reset(*death_fx_list);
+    game_over_delay = 0;
+    hit_flash_timer = 0;
+    victory_flash_timer = 0;
     kick_spawned = 0;
     punch_spawned = 0;
+    skate_spawned = 0;
     game_over = false;
     player_won = false;
     move_timer = 0;
