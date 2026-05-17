@@ -9,35 +9,66 @@ Input :: #import "Input";
 
 Simp :: #import "Simp";
 
-COLS :: 15;
-ROWS :: 13;
-TILE :: 60;
-BOMB_TIMER :: 135;
-POWERUP_DROP_RATE :: 0.5;
-ENEMY_MOVE_DELAY :: 20;
-START_FIRE_RANGE :: 1;
-START_MAX_BOMBS :: 1;
-ENEMY_FIRE_RANGE :: 1;
-EXPLOSION_DURATION :: 20;
-MELT_DURATION :: 14;
-POWERUP_SPAWN_DELAY :: 35;
-POWERUP_MELT_DURATION :: 12;
-BRICK_DENSITY :: 0.65;
-PLAYER_MOVE_DELAY :: 10;
-AI_BOMB_DIST :: 3;
-BOMB_SLIDE_SPEED :: 4;
-STUN_DURATION :: 60;
-KICK_MAX :: 4;
-PUNCH_MAX :: 4;
-SKATE_MAX :: 6;
-SKATE_BOOST_PLAYER :: 1;
-SKATE_BOOST_ENEMY :: 1;
-PLAYER_MOVE_DELAY_MIN :: 7;
-ENEMY_MOVE_DELAY_MIN :: 16;
-LERP_SPEED :: 0.25;
-PUNCH_HOP_FRAMES :: 14;
-PUNCH_ARC_HEIGHT :: 38.0;
-PLAYER_STUN :: 60;
+// All gameplay timings below are tick counts. The game runs vsync-locked at the
+// monitor refresh, intended for 60 Hz — so divide a *_FRAMES/*_DURATION value by
+// 60 to convert it to seconds.
+TARGET_FPS :: 60;
+
+// ─── Board shape ────────────────────────────────────────────────────────────
+COLS :: 15;                  // grid width in tiles
+ROWS :: 13;                  // grid height in tiles
+TILE :: 60;                  // one tile's size in world units / pixels
+
+// ─── Fuse + explosion timings (ticks @ 60 Hz) ───────────────────────────────
+BOMB_TIMER             :: 135;   // ticks from bomb placement to detonation (~2.25 s)
+EXPLOSION_DURATION     :: 20;    // ticks an explosion sprite is visible on the floor
+MELT_DURATION          :: 14;    // ticks a destroyed brick spends fading away
+POWERUP_SPAWN_DELAY    :: 35;    // ticks a fresh powerup is invisible/ungrabbable for
+POWERUP_MELT_DURATION  :: 12;    // ticks for a powerup's pickup/destroy animation
+
+// ─── Stun & projectile motion (ticks @ 60 Hz) ──────────────────────────────
+STUN_DURATION          :: 60;    // ticks an enemy stays knocked out after being punched
+PLAYER_STUN            :: 60;    // ticks the player is stunned when hit by a thrown bomb
+BOMB_SLIDE_SPEED       :: 4;     // ticks per tile traversed by a kicked bomb sliding
+PUNCH_HOP_FRAMES       :: 14;    // ticks per single tile in a punched bomb's arc hop
+PUNCH_ARC_HEIGHT       :: 38.0;  // peak height (pixels) of a punched bomb mid-arc
+LERP_SPEED             :: 0.25;  // per-tick lerp factor for character render position (0..1)
+
+// ─── Movement cadence (ticks per step) ──────────────────────────────────────
+PLAYER_MOVE_DELAY      :: 10;    // base ticks between player move steps (start)
+PLAYER_MOVE_DELAY_MIN  :: 7;     // floor for player move delay after skate pickups
+ENEMY_MOVE_DELAY       :: 20;    // base ticks between enemy AI move steps (start)
+ENEMY_MOVE_DELAY_MIN   :: 16;    // floor for enemy move delay after skate pickups
+SKATE_BOOST_PLAYER     :: 1;     // ticks shaved off player move delay per SKATE pickup
+SKATE_BOOST_ENEMY      :: 1;     // ticks shaved off enemy move delay per SKATE pickup
+AI_BOMB_DIST           :: 3;     // (legacy, unused — kept for reference)
+
+// ─── Powerup economy ────────────────────────────────────────────────────────
+START_MAX_BOMBS        :: 1;     // starting simultaneous bomb cap (player + enemies)
+START_FIRE_RANGE       :: 1;     // starting fire range in tiles (player)
+ENEMY_FIRE_RANGE       :: 1;     // starting fire range in tiles (enemy)
+POWERUP_DROP_RATE      :: 0.5;   // probability a destroyed brick drops a powerup
+BRICK_DENSITY          :: 0.65;  // probability a non-spawn tile starts as a brick
+KICK_MAX               :: 4;     // map-lifetime cap on spawned KICK powerups
+PUNCH_MAX              :: 4;     // map-lifetime cap on spawned PUNCH powerups
+SKATE_MAX              :: 6;     // map-lifetime cap on spawned SKATE powerups
+
+// ─── Enemy AI tuning ────────────────────────────────────────────────────────
+// Powerups are "pretended closer" to the enemy by this many tiles when picking
+// a target. Higher → enemies abandon hunts more aggressively to grab loot.
+POWERUP_INTEREST       :: 7;
+// Walking *through* a brick in the planning Dijkstra costs this many tile-steps
+// (one bomb fuse worth of waiting + the explosion + the step past). Roughly:
+// BOMB_TIMER / ENEMY_MOVE_DELAY ≈ 7, +1 for the step itself.
+BRICK_COST             :: 8;
+// Score offset added to other enemies as targets, so the AI prefers the player
+// and powerups over picking fights with siblings.
+ENEMY_AVOIDANCE        :: 3;
+// Enemies can't use KICK or PUNCH, so make them slightly less appealing as
+// targets than the powerups they actually benefit from.
+USELESS_PUP_PENALTY    :: 4;
+// Sentinel for "unreachable" in the Dijkstra field.
+DIJK_INF               :: 999999;
 
 WINDOW_W :: COLS * TILE;
 WINDOW_H :: ROWS * TILE;
@@ -54,6 +85,15 @@ Dir :: enum u8 {
     DOWN;
     LEFT;
     RIGHT;
+}
+
+// What the AI is currently chasing. Lets the chaser pick the right finisher:
+// ENTITY targets get bombed when in range; POWERUP targets are stepped onto and
+// MUST NOT be bombed (that would destroy them).
+TargetKind :: enum u8 {
+    NONE;
+    ENTITY;
+    POWERUP;
 }
 
 PType :: enum u8 {
@@ -193,8 +233,17 @@ saved_window_info: Saved_Window_Info;
 cam_mvp: Matrix4;
 
 // ─── Atmosphere & juice state ────────────────────────────────────────────────
-SHAKE_DECAY :: 0.84;
-SHAKE_MAX   :: 5.5;
+// SHAKE_INTENSITY: master shake knob.
+//   0   → disables shake completely
+//   0.5 → current default (very subtle)
+//   1   → previous dialled-down baseline
+//   2   → punchy / arcade-feel
+SHAKE_INTENSITY    :: 0.5;
+SHAKE_DECAY        :: 0.78;   // per-tick decay multiplier (lower → settles faster)
+SHAKE_MAX          :: 2.2;    // cap on accumulated shake_amount so chains can't over-shake
+SHAKE_PER_BOOM     :: 0.55;   // shake added per non-chain explosion
+SHAKE_PER_CHAIN    :: 0.95;   // shake added per chained explosion (more impactful)
+RECENT_BOOM_DECAY  :: 0.025;  // per-tick decay of `recent_boom` (drives warm-tint overlay)
 shake_amount: float;          // current shake intensity (decays each frame)
 recent_boom:  float;          // 0..1, brief surge that tints atmosphere
 
@@ -320,7 +369,7 @@ update_atmosphere :: () {
     }
 
     if recent_boom > 0 {
-        recent_boom -= 0.025;
+        recent_boom -= RECENT_BOOM_DECAY;
         if recent_boom < 0 recent_boom = 0;
     }
 }
@@ -337,6 +386,38 @@ draw_vgradient :: (x: float, y: float, w: float, h: float, top: Vector4, bot: Ve
         Vector2.{x,     y + h},
         top, top, bot, bot
     );
+}
+
+// Edge fade: solid `color` on one edge, fully transparent on the opposite.
+// `edge` picks which side is solid: 0=top, 1=bottom, 2=left, 3=right.
+draw_edge_fade :: (x: float, y: float, w: float, h: float, edge: int, color: Vector4) {
+    clear := Vector4.{color.x, color.y, color.z, 0};
+    if edge == {
+        case 0; // top solid
+            Simp.immediate_quad(
+                Vector2.{x,     y    }, Vector2.{x + w, y    },
+                Vector2.{x + w, y + h}, Vector2.{x,     y + h},
+                color, color, clear, clear
+            );
+        case 1; // bottom solid
+            Simp.immediate_quad(
+                Vector2.{x,     y    }, Vector2.{x + w, y    },
+                Vector2.{x + w, y + h}, Vector2.{x,     y + h},
+                clear, clear, color, color
+            );
+        case 2; // left solid
+            Simp.immediate_quad(
+                Vector2.{x,     y    }, Vector2.{x + w, y    },
+                Vector2.{x + w, y + h}, Vector2.{x,     y + h},
+                color, clear, clear, color
+            );
+        case 3; // right solid
+            Simp.immediate_quad(
+                Vector2.{x,     y    }, Vector2.{x + w, y    },
+                Vector2.{x + w, y + h}, Vector2.{x,     y + h},
+                clear, color, color, clear
+            );
+    }
 }
 
 init_grid :: () {
@@ -461,9 +542,9 @@ build_camera :: () {
     board_cz := cast(float) (ROWS * TILE) * 0.5;
 
     t := cast(float)frame_count;
-    sx := sin(t * 1.31 + 0.7) * shake_amount * 12.0;
-    sy := cos(t * 1.77 + 1.3) * shake_amount * 8.0;
-    sz := sin(t * 2.13 + 2.4) * shake_amount * 12.0;
+    sx := sin(t * 1.31 + 0.7) * shake_amount * 4.0 * SHAKE_INTENSITY;
+    sy := cos(t * 1.77 + 1.3) * shake_amount * 3.0 * SHAKE_INTENSITY;
+    sz := sin(t * 2.13 + 2.4) * shake_amount * 4.0 * SHAKE_INTENSITY;
 
     eye    := Vector3.{ board_cx + sx, 1700 + sy, board_cz + 260 + sz };
     target := Vector3.{ board_cx + sx * 0.4, 0, board_cz + sz * 0.4 };
@@ -1453,83 +1534,287 @@ draw_death_fx :: (fx: DeathFx, cx: float, cy: float) {
 
 draw_powerup :: (p: Powerup, cx: float, cy: float) {
     if p.delay > 0 return;
-    pulse := sin(cast(float)frame_count / 15.0) * 2;
-    bob := sin(cast(float)frame_count / 20.0) * 2;
+    pulse := sin(cast(float)frame_count / 14.0) * 1.4;
+    bob   := sin(cast(float)frame_count / 22.0) * 2.5;
+    base_c := powerup_color(p.type);
+
+    // Pedestal halo on the ground
+    ped_y := cy + 18;
+    for i: 0..2 {
+        rr := 24.0 + cast(float)i * 7.0;
+        a  := (0.32 - cast(float)i * 0.10);
+        draw_filled_ellipse(cx, ped_y, rr, rr * 0.42, col(base_c.x, base_c.y, base_c.z, a), 18);
+    }
+    draw_filled_ellipse(cx, ped_y + 1, 17, 6, col(0, 0, 0, 0.40), 16);
+    draw_filled_ellipse(cx, ped_y,     14, 5, col(base_c.x, base_c.y, base_c.z, 0.85), 16);
+    draw_filled_ellipse(cx, ped_y - 1, 9,  3, col(1, 1, 1, 0.55), 12);
+
+    iy := cy + bob - pulse;
 
     if p.type == {
         case .BOMB;
-            draw_triangle(cx, cy - 14 - pulse + bob, cx - 10, cy - 2 + bob, cx + 10, cy - 2 + bob, col(0.290, 0.078, 0.549, 1));
-            draw_triangle(cx, cy - 10 - pulse + bob, cx - 7, cy + bob, cx + 7, cy + bob, col(0.486, 0.302, 1.0, 1));
-            draw_triangle(cx, cy - 8 + bob, cx - 4, cy + 8 + bob, cx + 4, cy + 8 + bob, col(0.702, 0.533, 1.0, 1));
-        case .FIRE;
-            draw_rounded_rect(cx - 4, cy + bob - 14 - pulse, 8, 12, 2, col(0.365, 0.251, 0.216, 1));
-            draw_rounded_rect(cx - 6, cy + bob - 4 - pulse, 12, 8, 2, col(1.0, 0.435, 0, 1));
-            draw_rounded_rect(cx - 4, cy + bob - 2 - pulse, 8, 4, 1, col(1.0, 0.671, 0.251, 1));
-        case .KICK;
-            draw_triangle(cx, cy + bob - 14 - pulse, cx - 10, cy + bob + 2, cx + 10, cy + bob + 2, col(0, 0.376, 0.392, 1));
-            draw_triangle(cx, cy + bob - 10 - pulse, cx - 6, cy + bob + 2, cx + 6, cy + bob + 2, col(0, 0.737, 0.827, 1));
-        case .PUNCH;
-            draw_filled_circle(cx, cy + bob - pulse, 10, col(0.498, 0.376, 0, 1), 12);
-            draw_filled_circle(cx, cy + bob - pulse, 7, col(1.0, 0.757, 0.027, 1), 12);
-            for i: 0..5 {
-                angle := (cast(float)i / 6.0) * TAU + cast(float)frame_count / 40.0;
-                sx := cx + cos(angle) * 12;
-                sy := cy + bob - pulse + sin(angle) * 12;
-                draw_filled_circle(sx, sy, 2, col(1.0, 0.878, 0.510, 1), 4);
+            // Halo
+            for i: 0..2 {
+                rr := 26.0 + cast(float)i * 7.0;
+                a  := 0.32 - cast(float)i * 0.10;
+                draw_filled_circle(cx, iy - 4, rr, col(0.702, 0.404, 1.0, a), 14);
             }
+            // Four-pointed magic gem (vertical diamond) — clearly a collectible, not a bomb
+            gem_d := col(0.130, 0.025, 0.310, 1);   // dark outline
+            gem_m := col(0.486, 0.302, 1.0,   1);   // main facet
+            gem_l := col(0.83,  0.66,  1.0,   1);   // bright facet
+            gem_b := col(1.0,   0.92,  1.0,   1);   // tip glint
+
+            top_p := iy - 22;
+            bot_p := iy + 14;
+            rgt_p := cx + 15;
+            lft_p := cx - 15;
+            mid_y := iy - 4;
+
+            // Outer dark silhouette (slightly larger to act as a 1-pixel rim)
+            draw_triangle(cx, top_p - 1, rgt_p + 1, mid_y, cx, mid_y,        gem_d);
+            draw_triangle(cx, top_p - 1, lft_p - 1, mid_y, cx, mid_y,        gem_d);
+            draw_triangle(cx, bot_p + 1, rgt_p + 1, mid_y, cx, mid_y,        gem_d);
+            draw_triangle(cx, bot_p + 1, lft_p - 1, mid_y, cx, mid_y,        gem_d);
+            // Gem body facets
+            draw_triangle(cx, top_p, rgt_p, mid_y, cx, mid_y,                gem_m);
+            draw_triangle(cx, top_p, lft_p, mid_y, cx, mid_y,                gem_l);  // brighter top-left facet
+            draw_triangle(cx, bot_p, rgt_p, mid_y, cx, mid_y,                gem_d);  // shadowed bottom-right
+            draw_triangle(cx, bot_p, lft_p, mid_y, cx, mid_y,                gem_m);
+            // Center band highlight
+            draw_filled_rect(cx - 13, mid_y - 0.8, 26, 1.6, col(1, 1, 1, 0.40));
+
+            // Bold "+" emblem in the gem center — "upgrade" symbol
+            plus_w := 13.0;
+            plus_t := 3.5;
+            draw_filled_rect(cx - plus_w/2 - 0.6, mid_y - plus_t/2 - 0.6, plus_w + 1.2, plus_t + 1.2, gem_d);
+            draw_filled_rect(cx - plus_t/2 - 0.6, mid_y - plus_w/2 - 0.6, plus_t + 1.2, plus_w + 1.2, gem_d);
+            draw_filled_rect(cx - plus_w/2, mid_y - plus_t/2, plus_w, plus_t, gem_b);
+            draw_filled_rect(cx - plus_t/2, mid_y - plus_w/2, plus_t, plus_w, gem_b);
+            draw_filled_rect(cx - plus_w/2 + 0.5, mid_y - plus_t/2 + 0.5, plus_w - 1, 1.0, col(1, 1, 1, 0.85));
+
+            // Tip glints — sells the gem
+            tip_pulse := 0.7 + 0.3 * sin(cast(float)frame_count / 7.0);
+            draw_filled_circle(cx,            top_p + 1, 2.2 * tip_pulse, gem_b, 6);
+            draw_filled_circle(cx,            bot_p - 1, 1.4 * tip_pulse, gem_b, 5);
+            draw_filled_circle(rgt_p - 1,     mid_y,     1.4 * tip_pulse, gem_b, 5);
+            draw_filled_circle(lft_p + 1,     mid_y,     1.4 * tip_pulse, gem_b, 5);
+
+            // Orbiting sparkles signal "magical pickup"
+            for i: 0..3 {
+                ang := cast(float)frame_count / 22.0 + cast(float)i * (TAU / 4.0);
+                ox  := cos(ang) * 26.0;
+                oy  := sin(ang) * 8.0 - 2.0;
+                sz  := 1.6 + sin(cast(float)frame_count / 9.0 + cast(float)i) * 0.4;
+                draw_filled_circle(cx + ox, iy + oy, sz * 2.0, col(1.0, 0.85, 1.0, 0.30), 6);
+                draw_filled_circle(cx + ox, iy + oy, sz,       col(1.0, 0.95, 1.0, 0.95), 5);
+            }
+
+        case .FIRE;
+            // Halo
+            for i: 0..2 {
+                rr := 26.0 + cast(float)i * 6.0;
+                a  := 0.30 - cast(float)i * 0.09;
+                draw_filled_circle(cx, iy - 6, rr, col(1.0, 0.55, 0.20, a), 14);
+            }
+            flicker := sin(cast(float)frame_count / 4.0) * 1.6;
+            // Outer flame (red), drop-shaped: ellipse base + sharp triangle tip
+            draw_filled_ellipse(cx, iy + 2, 16, 16, col(0.78, 0.14, 0.10, 1), 18);
+            draw_triangle(cx - 16, iy + 2, cx + 16, iy + 2, cx + flicker, iy - 26, col(0.78, 0.14, 0.10, 1));
+            // Mid flame (orange)
+            draw_filled_ellipse(cx, iy + 4, 11, 13, col(1.0, 0.45, 0.12, 1), 16);
+            draw_triangle(cx - 11, iy + 4, cx + 11, iy + 4, cx + flicker * 0.7, iy - 18, col(1.0, 0.45, 0.12, 1));
+            // Inner flame (yellow-orange)
+            draw_filled_ellipse(cx, iy + 5, 7, 10, col(1.0, 0.72, 0.20, 1), 14);
+            draw_triangle(cx - 7, iy + 5, cx + 7, iy + 5, cx + flicker * 0.4, iy - 11, col(1.0, 0.72, 0.20, 1));
+            // Hot core
+            draw_filled_ellipse(cx, iy + 6, 4, 6, col(1, 0.95, 0.55, 1), 12);
+            draw_filled_circle(cx, iy + 7, 2.6, col(1, 1, 1, 0.9), 10);
+            // A few rising sparks
+            for i: 0..2 {
+                spk_phase := cast(float)((frame_count + i * 17) % 40) / 40.0;
+                sxp := cx + cos(cast(float)i * 2.0) * 6;
+                syp := iy + 2 - spk_phase * 24;
+                ap := 1.0 - spk_phase;
+                draw_filled_circle(sxp, syp, 1.4 * ap, col(1, 0.85, 0.40, ap), 5);
+            }
+
+        case .KICK;
+            // Halo
+            for i: 0..2 {
+                rr := 24.0 + cast(float)i * 6.0;
+                a  := 0.30 - cast(float)i * 0.09;
+                draw_filled_circle(cx, iy - 2, rr, col(0, 0.737, 0.827, a), 14);
+            }
+            // Big stylized boot in cyan
+            boot_d := col(0.040, 0.180, 0.220, 1);
+            boot_m := col(0,     0.737, 0.827, 1);
+            boot_h := col(0.55,  0.93,  0.97,  1);
+            // Sole — wide pill across the bottom
+            draw_rounded_rect(cx - 19, iy + 2,  38, 10, 4, boot_d);
+            draw_rounded_rect(cx - 18, iy + 3,  36, 7,  3, boot_m);
+            // Shaft — tall pill on the right
+            draw_rounded_rect(cx - 5,  iy - 18, 18, 22, 4, boot_d);
+            draw_rounded_rect(cx - 4,  iy - 17, 16, 20, 3, boot_m);
+            // Lace highlights
+            for i: 0..3 {
+                ly := iy - 14 + cast(float)i * 5;
+                draw_filled_rect(cx - 1, ly, 12, 1.8, boot_h);
+            }
+            // Toe highlight
+            draw_filled_rect(cx - 16, iy + 4, 6, 2.5, boot_h);
+            // Impact stars — kicks bombs!
+            for i: 0..3 {
+                ang := (cast(float)i / 4.0) * TAU + PI/4 + cast(float)frame_count / 32.0;
+                ox  := cos(ang) * 24;
+                oy  := sin(ang) * 9 + 2;
+                draw_filled_circle(cx + ox, iy + oy, 1.7, col(0.85, 1, 1, 0.7), 5);
+            }
+
+        case .PUNCH;
+            // Halo
+            for i: 0..2 {
+                rr := 26.0 + cast(float)i * 6.0;
+                a  := 0.30 - cast(float)i * 0.09;
+                draw_filled_circle(cx, iy - 2, rr, col(1.0, 0.78, 0.20, a), 14);
+            }
+            // Boxing glove
+            glove_d := col(0.40, 0.18, 0.02, 1);
+            glove_m := col(1.0,  0.757, 0.027, 1);
+            glove_h := col(1.0,  0.92,  0.60,  1);
+            // Wrist cuff
+            draw_rounded_rect(cx - 11, iy + 4, 22, 11, 3, glove_d);
+            draw_rounded_rect(cx - 10, iy + 5, 20, 9,  2.5, col(0.78, 0.45, 0.10, 1));
+            // White stripe across cuff
+            draw_filled_rect(cx - 10, iy + 9, 20, 1.6, col(1, 1, 1, 0.85));
+            // Main fist
+            draw_filled_circle(cx,       iy - 4, 20, glove_d, 18);
+            draw_filled_circle(cx,       iy - 4, 18, glove_m, 18);
+            // Thumb knuckle
+            draw_filled_circle(cx - 15,  iy - 1, 8,  glove_d, 12);
+            draw_filled_circle(cx - 15,  iy - 1, 6.4, glove_m, 12);
+            // Knuckle ridges
+            for i: 0..3 {
+                kx := cx - 6 + cast(float)i * 5;
+                draw_filled_circle(kx, iy - 13, 2.3, glove_d, 6);
+            }
+            // Highlight
+            draw_filled_circle(cx - 4, iy - 10, 7, glove_h, 12);
+            draw_filled_circle(cx - 7, iy - 13, 2.8, col(1, 1, 1, 0.95), 6);
+            // Impact zaps
+            for i: 0..3 {
+                ang := (cast(float)i / 4.0) * TAU + cast(float)frame_count / 26.0;
+                ox  := cos(ang) * 26;
+                oy  := sin(ang) * 10;
+                draw_filled_circle(cx + ox, iy + oy, 1.9, col(1, 0.95, 0.45, 0.7), 5);
+            }
+
         case .SKATE;
-            yy := cy + bob - pulse;
-            wheel_c := col(0.137, 0.165, 0.255, 1);
-            boot_d  := col(0.298, 0.329, 0.451, 1);
-            boot_l  := col(0.490, 0.604, 0.749, 1);
-            draw_filled_rect(cx - 7, yy - 5, 14, 5, boot_d);
-            draw_filled_rect(cx + 1, yy - 11, 7, 6, boot_d);
-            draw_filled_rect(cx + 2, yy - 10, 5, 1, boot_l);
-            draw_filled_rect(cx - 6, yy - 4, 12, 1, boot_l);
-            draw_filled_circle(cx - 4, yy + 1, 2.5, wheel_c, 8);
-            draw_filled_circle(cx + 1, yy + 1, 2.5, wheel_c, 8);
-            draw_filled_circle(cx + 6, yy + 1, 2.5, wheel_c, 8);
-            // motion zaps behind the boot
-            for i: 0..1 {
-                a := col(0.420, 0.812, 1.0, 0.7 - cast(float)i * 0.25);
-                ox := -10.0 - cast(float)i * 4;
-                draw_triangle(cx + ox, yy - 6, cx + ox + 5, yy - 9, cx + ox + 4, yy - 6, a);
-                draw_triangle(cx + ox + 4, yy - 6, cx + ox + 8, yy - 2, cx + ox + 5, yy - 2, a);
+            // Halo
+            for i: 0..2 {
+                rr := 24.0 + cast(float)i * 6.0;
+                a  := 0.30 - cast(float)i * 0.09;
+                draw_filled_circle(cx, iy, rr, col(0.42, 0.81, 1.0, a), 14);
+            }
+            wheel_c := col(0.10, 0.13, 0.22, 1);
+            boot_d  := col(0.14, 0.20, 0.34, 1);
+            boot_m  := col(0.50, 0.70, 0.98, 1);
+            boot_l  := col(0.85, 0.95, 1.0,  1);
+            // Boot
+            draw_rounded_rect(cx - 16, iy - 14, 26, 13, 4, boot_d);
+            draw_rounded_rect(cx - 15, iy - 13, 24, 11, 3.5, boot_m);
+            // Cuff
+            draw_rounded_rect(cx + 4,  iy - 24, 14, 11, 3, boot_d);
+            draw_rounded_rect(cx + 5,  iy - 23, 12, 9,  2.5, boot_m);
+            // Lace highlight on cuff
+            draw_filled_rect(cx + 6, iy - 20, 10, 1.6, boot_l);
+            // Frame under boot
+            draw_rounded_rect(cx - 17, iy - 1, 30, 4, 1.5, boot_d);
+            // Wheels — three big visible
+            for i: 0..2 {
+                wx := cx - 12 + cast(float)i * 11;
+                draw_filled_circle(wx, iy + 6, 5.5, boot_d, 12);
+                draw_filled_circle(wx, iy + 6, 4,   wheel_c, 12);
+                draw_filled_circle(wx, iy + 6, 1.6, col(0.50, 0.70, 0.98, 1), 8);
+            }
+            // Speed lines trailing behind
+            for i: 0..2 {
+                a := col(0.55, 0.92, 1.0, 0.75 - cast(float)i * 0.22);
+                ox := -22.0 - cast(float)i * 8;
+                draw_filled_rect(cx + ox, iy - 8 - cast(float)i * 2.5, 9, 1.8, a);
             }
     }
 }
 
 draw_melting_powerup :: (m: MeltingPowerup, cx: float, cy: float) {
     pct := cast(float)m.timer / cast(float)POWERUP_MELT_DURATION;
-    shrink := (1 - pct) * 14;
-    h := 16 - shrink;
-    dark_c, mid_c, light_c: Vector4;
-    if m.type == {
-        case .BOMB;
-            dark_c = col(0.290, 0.078, 0.549, pct);
-            mid_c = col(0.486, 0.302, 1.0, pct);
-            light_c = col(0.702, 0.533, 1.0, (1 - pct) * 0.5);
-        case .KICK;
-            dark_c = col(0, 0.376, 0.392, pct);
-            mid_c = col(0, 0.737, 0.827, pct);
-            light_c = col(0.502, 0.871, 0.918, (1 - pct) * 0.5);
-        case .PUNCH;
-            dark_c = col(0.498, 0.376, 0, pct);
-            mid_c = col(1.0, 0.757, 0.027, pct);
-            light_c = col(1.0, 0.878, 0.510, (1 - pct) * 0.5);
-        case .FIRE;
-            dark_c = col(0.365, 0.251, 0.216, pct);
-            mid_c = col(1.0, 0.435, 0, pct);
-            light_c = col(1.0, 0.671, 0.251, (1 - pct) * 0.5);
-        case .SKATE;
-            dark_c = col(0.137, 0.243, 0.420, pct);
-            mid_c = col(0.298, 0.541, 0.812, pct);
-            light_c = col(0.612, 0.851, 1.0, (1 - pct) * 0.5);
+    shrink := (1 - pct) * 24;
+    h := 32 - shrink;
+    base_c := powerup_color(m.type);
+    dark_c  := col(base_c.x * 0.55, base_c.y * 0.55, base_c.z * 0.55, pct);
+    mid_c   := col(base_c.x,        base_c.y,        base_c.z,        pct);
+    light_c := col(min(1.0, base_c.x + 0.25), min(1.0, base_c.y + 0.25), min(1.0, base_c.z + 0.25), (1 - pct) * 0.55);
+
+    // Shock ring expanding outward
+    ring_r := (1 - pct) * 22.0;
+    draw_filled_ellipse(cx, cy + 4, ring_r, ring_r * 0.4, col(base_c.x, base_c.y, base_c.z, (1 - pct) * 0.5), 16);
+    // Shrinking diamond
+    draw_filled_rect(cx - h/2,     cy - h/2,     h,     h,     dark_c);
+    draw_filled_rect(cx - h/2 + 3, cy - h/2 + 3, h - 6, h - 6, mid_c);
+    draw_filled_circle(cx, cy, (1 - pct) * 10, light_c, 10);
+}
+
+drop_enemy_powerups :: (e: *Enemy) {
+    // Collect the powerup types this enemy was holding.
+    types: [..] PType;
+    types.allocator = temp;
+    extra_bombs := e.max_bombs - START_MAX_BOMBS;
+    extra_fire  := e.fire_range - ENEMY_FIRE_RANGE;
+    extra_skate := e.skate_count;
+    for i: 0..extra_bombs - 1 array_add(*types, PType.BOMB);
+    for i: 0..extra_fire  - 1 array_add(*types, PType.FIRE);
+    for i: 0..extra_skate - 1 array_add(*types, PType.SKATE);
+    if types.count == 0 return;
+
+    // Build a fresh list of valid empty tiles (no walls, no bricks, no bombs, no existing powerups, no entities).
+    candidates: [..] BFSNode;
+    candidates.allocator = temp;
+    for r: 1..ROWS - 2 {
+        for c: 1..COLS - 2 {
+            if grid[r][c] != .EMPTY continue;
+            occupied := false;
+            for bombs        if !it.punching && it.x == c && it.y == r { occupied = true; break; }
+            if occupied continue;
+            for powerups     if it.x == c && it.y == r { occupied = true; break; }
+            if occupied continue;
+            for explosions_list if it.x == c && it.y == r { occupied = true; break; }
+            if occupied continue;
+            if player.x == c && player.y == r continue;
+            for * en: enemies if en.alive && en.x == c && en.y == r { occupied = true; break; }
+            if occupied continue;
+            n: BFSNode;
+            n.x = c; n.y = r;
+            array_add(*candidates, n);
+        }
     }
 
-    draw_filled_rect(cx - h/2, cy - h/2, h, h, dark_c);
-    draw_filled_rect(cx - h/2 + 2, cy - h/2 + 2, h - 4, h - 4, mid_c);
-    draw_filled_circle(cx, cy, (1 - pct) * 6, light_c, 8);
+    // Place each type at a random remaining tile.
+    for t: types {
+        if candidates.count == 0 break;
+        idx := cast(int)(random_get() % cast(u64) candidates.count);
+        pos := candidates[idx];
+        array_unordered_remove_by_index(*candidates, idx);
+
+        pu: Powerup;
+        pu.x = pos.x;
+        pu.y = pos.y;
+        pu.type = t;
+        pu.delay = POWERUP_SPAWN_DELAY;
+        array_add(*powerups, pu);
+
+        // A subtle pop where it lands so the player can spot it
+        spawn_fx(cast(float)pu.x, cast(float)pu.y, powerup_color(t), .SMALL);
+    }
 }
 
 place_bomb :: () {
@@ -1555,7 +1840,7 @@ explode :: (b: Bomb) {
     e.origin = true;
     array_add(*explosions_list, e);
 
-    add_shake(ifx b.chain then 1.65 else 1.05);
+    add_shake(ifx b.chain then SHAKE_PER_CHAIN else SHAKE_PER_BOOM);
     recent_boom = 1.0;
 
     for dir_idx: 0..3 {
@@ -1775,40 +2060,209 @@ find_safe_cell :: (sx: int, sy: int, extra: [] Bomb = .[]) -> bool, int, int {
     return false, -1, -1;
 }
 
-find_nearest_target :: (e: *Enemy) -> bool, int, int {
-    best_x := -1;
-    best_y := -1;
-    best_score := 999999;
+// Would a bomb dropped at (bx,by) with this `range` blow up the tile (x,y)?
+// Mirrors the propagation rules in explode(): a wall, a melting brick, or a
+// regular brick stops the line (the brick itself is hit, but anything past it
+// is safe).
+bomb_hits_tile :: (bx: int, by: int, range: int, x: int, y: int) -> bool {
+    if bx == x && by == y return true;
+    for dir_idx: 0..3 {
+        dx := DIRS[dir_idx * 2];
+        dy := DIRS[dir_idx * 2 + 1];
+        for i: 1..range {
+            nx := bx + dx * i;
+            ny := by + dy * i;
+            if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+            if nx == x && ny == y return true;
+            if grid[ny][nx] == .BRICK break;
+        }
+    }
+    return false;
+}
 
-    d := abs(e.x - player.x) + abs(e.y - player.y);
-    if d < best_score {
-        best_score = d;
-        best_x = player.x;
-        best_y = player.y;
+// Count how many bricks would be cracked by a bomb dropped at (bx, by) with
+// this fire range. Walls/melting-bricks stop the line; the brick itself is hit
+// then the line stops.
+count_bricks_hit :: (bx: int, by: int, range: int) -> int {
+    n := 0;
+    for dir_idx: 0..3 {
+        dx := DIRS[dir_idx * 2];
+        dy := DIRS[dir_idx * 2 + 1];
+        for i: 1..range {
+            nx := bx + dx * i;
+            ny := by + dy * i;
+            if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS break;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING break;
+            if grid[ny][nx] == .BRICK { n += 1; break; }
+        }
+    }
+    return n;
+}
+
+// "How many ticks would it cost me to reach every other tile?" — a weighted
+// flood-fill where stepping onto an empty tile costs 1 and stepping onto a
+// BRICK costs BRICK_COST (bomb fuse + step). Walls, melting bricks, and bombs
+// are impassable. Used by the AI to score targets and to find which brick to
+// bust when the strict-safe path is blocked.
+DijkstraField :: struct {
+    dist:   [ROWS][COLS] int;
+    parent: [ROWS][COLS] BFSNode;
+}
+
+dijkstra_through_bricks :: (sx: int, sy: int) -> DijkstraField {
+    f: DijkstraField;
+    for r: 0..ROWS-1 {
+        for c: 0..COLS-1 {
+            f.dist[r][c] = DIJK_INF;
+            p: BFSNode; p.x = -1; p.y = -1;
+            f.parent[r][c] = p;
+        }
+    }
+    if sx < 0 || sx >= COLS || sy < 0 || sy >= ROWS return f;
+    f.dist[sy][sx] = 0;
+
+    visited: [ROWS][COLS] bool;
+    while true {
+        // Pick the unvisited tile with the smallest tentative cost. Grid is
+        // tiny (≤195 cells), so a linear scan beats any heap setup.
+        bestd := DIJK_INF;
+        bx := -1; by := -1;
+        for r: 0..ROWS-1 {
+            for c: 0..COLS-1 {
+                if !visited[r][c] && f.dist[r][c] < bestd {
+                    bestd = f.dist[r][c];
+                    bx = c; by = r;
+                }
+            }
+        }
+        if bx < 0 break;
+        visited[by][bx] = true;
+
+        for dir_idx: 0..3 {
+            nx := bx + DIRS[dir_idx * 2];
+            ny := by + DIRS[dir_idx * 2 + 1];
+            if nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS continue;
+            if grid[ny][nx] == .WALL || grid[ny][nx] == .BRICK_MELTING continue;
+            blocked := false;
+            for bombs if !it.punching && it.x == nx && it.y == ny { blocked = true; break; }
+            if blocked continue;
+
+            step_cost := ifx grid[ny][nx] == .BRICK then BRICK_COST else 1;
+            nd := bestd + step_cost;
+            if nd < f.dist[ny][nx] {
+                f.dist[ny][nx] = nd;
+                p: BFSNode;
+                p.x = bx; p.y = by;
+                f.parent[ny][nx] = p;
+            }
+        }
+    }
+    return f;
+}
+
+// Walks the parent chain from (tx, ty) back toward (sx, sy) and returns the
+// first BRICK tile on that path — the one we'd need to bust to make progress.
+// Returns (-1, -1) if the path is brick-free or the target is unreachable.
+first_brick_on_path :: (f: DijkstraField, sx: int, sy: int, tx: int, ty: int) -> bx: int, by: int {
+    if tx == sx && ty == sy return -1, -1;
+    if f.dist[ty][tx] >= DIJK_INF return -1, -1;
+
+    path: [..] BFSNode;
+    path.allocator = temp;
+    cx := tx;
+    cy := ty;
+    safety := 0;
+    while !(cx == sx && cy == sy) {
+        n: BFSNode;
+        n.x = cx; n.y = cy;
+        array_add(*path, n);
+        p := f.parent[cy][cx];
+        if p.x < 0 break;
+        cx = p.x; cy = p.y;
+        safety += 1;
+        if safety > ROWS * COLS break;
+    }
+    // path[0] is the target; path[last] is the first step from start. Walk
+    // from start-side back so we hit the *first* brick we'd encounter.
+    for i: 0..path.count-1 {
+        idx := path.count - 1 - i;
+        n := path[idx];
+        if grid[n.y][n.x] == .BRICK return n.x, n.y;
+    }
+    return -1, -1;
+}
+
+// Pick the best empty tile to walk to for brick-farming. Score favours tiles
+// that hit multiple bricks at once, and penalises distance. Skips tiles
+// already in a blast (we'd just die there).
+find_best_farm_tile :: (e: *Enemy, f: DijkstraField) -> int, int {
+    best_x := -1; best_y := -1;
+    best_score := -1;
+    for r: 1..ROWS-2 {
+        for c: 1..COLS-2 {
+            if grid[r][c] != .EMPTY continue;
+            if f.dist[r][c] >= DIJK_INF continue;
+            if is_in_blast(c, r) continue;
+            adj := count_bricks_hit(c, r, e.fire_range);
+            if adj == 0 continue;
+            score := adj * 100 - f.dist[r][c];
+            if score > best_score {
+                best_score = score;
+                best_x = c; best_y = r;
+            }
+        }
+    }
+    return best_x, best_y;
+}
+
+// Returns the most appealing target for this enemy using actual path costs:
+// the planning Dijkstra (which can traverse bricks at BRICK_COST) gives a
+// realistic "how long would it take me to get there?" metric. Powerups get a
+// POWERUP_INTEREST head start; rival enemies get a small penalty (we'd rather
+// chase the player); KICK/PUNCH powerups are slightly less appealing because
+// enemies can't actually use those.
+find_best_target :: (e: *Enemy, f: DijkstraField) -> kind: TargetKind, x: int, y: int {
+    best_kind  := TargetKind.NONE;
+    best_x     := -1;
+    best_y     := -1;
+    best_score := DIJK_INF;
+
+    if f.dist[player.y][player.x] < DIJK_INF {
+        s := f.dist[player.y][player.x];
+        if s < best_score {
+            best_score = s;
+            best_x = player.x; best_y = player.y;
+            best_kind = .ENTITY;
+        }
     }
 
     for * other: enemies {
-        if other != e && other.alive {
-            d2 := abs(e.x - other.x) + abs(e.y - other.y);
-            if d2 < best_score {
-                best_score = d2;
-                best_x = other.x;
-                best_y = other.y;
-            }
+        if other == e || !other.alive continue;
+        d := f.dist[other.y][other.x];
+        if d >= DIJK_INF continue;
+        s := d + ENEMY_AVOIDANCE;
+        if s < best_score {
+            best_score = s;
+            best_x = other.x; best_y = other.y;
+            best_kind = .ENTITY;
         }
     }
 
     for powerups {
         if it.delay > 0 continue;
-        d2 := abs(e.x - it.x) + abs(e.y - it.y) - 4;
-        if d2 < best_score {
-            best_score = d2;
-            best_x = it.x;
-            best_y = it.y;
+        d := f.dist[it.y][it.x];
+        if d >= DIJK_INF continue;
+        s := d - POWERUP_INTEREST;
+        if it.type == .KICK || it.type == .PUNCH s += USELESS_PUP_PENALTY;
+        if s < best_score {
+            best_score = s;
+            best_x = it.x; best_y = it.y;
+            best_kind = .POWERUP;
         }
     }
 
-    return best_x >= 0, best_x, best_y;
+    return best_kind, best_x, best_y;
 }
 
 set_enemy_dir :: (e: *Enemy, dx: int, dy: int) {
@@ -1917,6 +2371,29 @@ enemy_move_random_safe :: (e: *Enemy) {
 enemy_try_place_bomb :: (e: *Enemy, active_bombs: int, max_escape_steps: int) -> bool {
     if active_bombs >= e.max_bombs return false;
     if is_in_blast(e.x, e.y) return false;
+
+    // A free kill from here? Then loot preservation is off — winning the round
+    // matters more than saving a powerup.
+    would_kill := bomb_hits_tile(e.x, e.y, e.fire_range, player.x, player.y);
+    if !would_kill {
+        for * other: enemies {
+            if other == e || !other.alive continue;
+            if bomb_hits_tile(e.x, e.y, e.fire_range, other.x, other.y) {
+                would_kill = true;
+                break;
+            }
+        }
+    }
+
+    if !would_kill {
+        // Never drop a bomb whose blast would destroy an unclaimed powerup —
+        // they're worth more to us alive on the floor than vaporised.
+        for powerups {
+            if it.delay > 0 continue;
+            if bomb_hits_tile(e.x, e.y, e.fire_range, it.x, it.y) return false;
+        }
+    }
+
     sim: [1] Bomb;
     sim[0].x = e.x; sim[0].y = e.y; sim[0].range = e.fire_range; sim[0].owner = e.id; sim[0].timer = BOMB_TIMER;
     found, sx, sy := find_safe_cell(e.x, e.y, sim);
@@ -1955,45 +2432,109 @@ update_single_enemy :: (e: *Enemy) {
     active_bombs := 0;
     for bombs if it.owner == e.id active_bombs += 1;
 
-    has_target, tx, ty := find_nearest_target(e);
+    field := dijkstra_through_bricks(e.x, e.y);
+    target_kind, tx, ty := find_best_target(e, field);
 
-    // PHASE 2 — Pursue, but never step into a blast.
-    if has_target {
+    // PHASE 2 — Strike now if any living rival sits inside our blast line. This
+    // overrides whatever target we'd picked: a free kill beats farming.
+    if active_bombs < e.max_bombs {
+        in_blast_line := bomb_hits_tile(e.x, e.y, e.fire_range, player.x, player.y);
+        if !in_blast_line {
+            for * other: enemies {
+                if other == e || !other.alive continue;
+                if bomb_hits_tile(e.x, e.y, e.fire_range, other.x, other.y) {
+                    in_blast_line = true;
+                    break;
+                }
+            }
+        }
+        if in_blast_line && enemy_try_place_bomb(e, active_bombs, max_escape_steps) {
+            e.idle_streak = 0;
+            return;
+        }
+    }
+
+    // PHASE 3 — Pursue along a strictly safe path. Bricks aren't walkable here,
+    // so this only finds routes through existing corridors.
+    if target_kind != .NONE {
         path := bfs_path(e.x, e.y, tx, ty, avoid_blast = true);
         if path.count > 0 {
             ns := path[0];
-            // BFS already avoided blast, but double-check + don't immediately U-turn unless target is right there.
-            if !is_in_blast(ns.x, ns.y) {
-                if ns.x == e.last_x && ns.y == e.last_y && path.count > 1 {
-                    // Skip backtrack only if a better-progress alternative exists.
-                    alt := bfs_path(e.x, e.y, tx, ty, avoid_blast = true);
-                    if alt.count > 0 && !(alt[0].x == e.last_x && alt[0].y == e.last_y) ns = alt[0];
-                }
+            if can_walk_safe(ns.x, ns.y) && !is_in_blast(ns.x, ns.y) {
                 enemy_step_to(e, ns.x, ns.y);
-                dist := abs(e.x - tx) + abs(e.y - ty);
-                if dist <= e.fire_range && dist > 0 && active_bombs < e.max_bombs {
-                    enemy_try_place_bomb(e, active_bombs, max_escape_steps);
-                }
                 return;
             }
         }
     }
 
-    // PHASE 3 — No safe path. Try opportunistic brick-busting if we can do it safely.
-    has_adj_brick := false;
-    for dir_idx: 0..3 {
-        nx := e.x + DIRS[dir_idx * 2];
-        ny := e.y + DIRS[dir_idx * 2 + 1];
-        if nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS && grid[ny][nx] == .BRICK {
-            has_adj_brick = true;
-            break;
+    // PHASE 4 — Strict path failed. The planning Dijkstra knows a route that
+    // passes through one or more bricks — bust the first brick on that route.
+    if target_kind != .NONE {
+        bx, by := first_brick_on_path(field, e.x, e.y, tx, ty);
+        if bx >= 0 {
+            adjacent := abs(bx - e.x) + abs(by - e.y) == 1;
+            if adjacent && bomb_hits_tile(e.x, e.y, e.fire_range, bx, by) {
+                if active_bombs < e.max_bombs && enemy_try_place_bomb(e, active_bombs, max_escape_steps) {
+                    e.idle_streak = 0;
+                    return;
+                }
+            }
+            if !adjacent {
+                // Approach the brick from whichever empty neighbour is closest
+                // to us along a strictly safe path.
+                approach_x := -1; approach_y := -1;
+                approach_d := DIJK_INF;
+                for dir_idx: 0..3 {
+                    ax := bx + DIRS[dir_idx * 2];
+                    ay := by + DIRS[dir_idx * 2 + 1];
+                    if ax < 0 || ax >= COLS || ay < 0 || ay >= ROWS continue;
+                    if grid[ay][ax] != .EMPTY continue;
+                    if is_in_blast(ax, ay) continue;
+                    d := field.dist[ay][ax];
+                    if d < approach_d {
+                        approach_d = d;
+                        approach_x = ax; approach_y = ay;
+                    }
+                }
+                if approach_x >= 0 {
+                    apath := bfs_path(e.x, e.y, approach_x, approach_y, avoid_blast = true);
+                    if apath.count > 0 {
+                        ns := apath[0];
+                        if can_walk_safe(ns.x, ns.y) && !is_in_blast(ns.x, ns.y) {
+                            enemy_step_to(e, ns.x, ns.y);
+                            return;
+                        }
+                    }
+                }
+            }
         }
     }
-    if has_adj_brick && active_bombs < e.max_bombs {
-        if enemy_try_place_bomb(e, active_bombs, max_escape_steps) return;
+
+    // PHASE 5 — Productive idle: if a bomb dropped right here would crack some
+    // bricks, do it. This is what a real player does between hunts.
+    if active_bombs < e.max_bombs {
+        n := count_bricks_hit(e.x, e.y, e.fire_range);
+        if n > 0 && enemy_try_place_bomb(e, active_bombs, max_escape_steps) {
+            e.idle_streak = 0;
+            return;
+        }
     }
 
-    // PHASE 4 — Idle. Stay put unless we've been still for a while (avoid frozen look).
+    // PHASE 6 — Walk toward a brick-cluster tile so we can farm next tick.
+    fx_, fy_ := find_best_farm_tile(e, field);
+    if fx_ >= 0 && !(fx_ == e.x && fy_ == e.y) {
+        fpath := bfs_path(e.x, e.y, fx_, fy_, avoid_blast = true);
+        if fpath.count > 0 {
+            ns := fpath[0];
+            if can_walk_safe(ns.x, ns.y) && !is_in_blast(ns.x, ns.y) {
+                enemy_step_to(e, ns.x, ns.y);
+                return;
+            }
+        }
+    }
+
+    // PHASE 7 — Truly nothing to do. Stay put a beat, then nudge so we don't
+    // freeze in place.
     e.idle_streak += 1;
     if e.idle_streak > 5 {
         enemy_move_random_safe(e);
@@ -2288,6 +2829,7 @@ update :: () {
             if en.alive && it.x == en.x && it.y == en.y {
                 en.alive = false;
                 spawn_death_fx(en.rx, en.ry, en.glow, true);
+                drop_enemy_powerups(en);
             }
         }
     }
@@ -2632,26 +3174,13 @@ render :: () {
     vw := cast(float)WINDOW_W;
     vh := cast(float)WINDOW_H;
 
-    // Radial-ish vignette: edge bands (heavier) + corner darkening + soft outer glow on top edges
-    vig_edge := col(0.0, 0.0, 0.020, 0.40);
-    band :: 110.0;
-    draw_filled_rect(0, 0,            vw,   band,       vig_edge);
-    draw_filled_rect(0, vh - band,    vw,   band,       vig_edge);
-    draw_filled_rect(0, 0,            band, vh,         vig_edge);
-    draw_filled_rect(vw - band, 0,    band, vh,         vig_edge);
-    // Soft inner second band
-    vig2 := col(0.0, 0.0, 0.020, 0.22);
-    draw_filled_rect(0, 0,            vw,   band * 0.55, vig2);
-    draw_filled_rect(0, vh - band*0.55, vw,  band * 0.55, vig2);
-    draw_filled_rect(0, 0,            band * 0.55, vh,   vig2);
-    draw_filled_rect(vw - band*0.55, 0, band * 0.55, vh, vig2);
-    // Heavier corners (overlapping)
-    vig_corn := col(0.0, 0.0, 0.020, 0.32);
-    cs :: 220.0;
-    draw_filled_rect(0,           0,           cs, cs, vig_corn);
-    draw_filled_rect(vw - cs,     0,           cs, cs, vig_corn);
-    draw_filled_rect(0,           vh - cs,     cs, cs, vig_corn);
-    draw_filled_rect(vw - cs,     vh - cs,     cs, cs, vig_corn);
+    // Smooth edge fades — no square corners, just gentle inward fades for atmosphere.
+    vig := col(0.0, 0.0, 0.020, 0.30);
+    band :: 90.0;
+    draw_edge_fade(0, 0,         vw,   band, 0, vig);
+    draw_edge_fade(0, vh - band, vw,   band, 1, vig);
+    draw_edge_fade(0, 0,         band, vh,   2, vig);
+    draw_edge_fade(vw - band, 0, band, vh,   3, vig);
 
     // Top warm-tint atmosphere overlay tied to recent explosions
     if recent_boom > 0 {
