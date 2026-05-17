@@ -284,7 +284,8 @@ volcanic_theme :: () -> Theme {
     t.mote_a = col(1.0,  0.55, 0.18, 1);   // ember orange
     t.mote_b = col(1.0,  0.80, 0.35, 1);   // hot yellow
     t.mote_c = col(0.55, 0.30, 0.20, 1);   // soot brown
-    t.wall_renderer = draw_wall_volcanic;
+    t.wall_renderer  = draw_wall_volcanic;
+    t.brick_renderer = draw_brick_volcanic;
     return t;
 }
 
@@ -472,10 +473,11 @@ vanilla_mechanic :: () -> LevelMechanic {
 
 volcanic_mechanic :: () -> LevelMechanic {
     m: LevelMechanic;
-    m.setup       = setup_mine_cart;
-    m.tick        = update_mine_cart;
-    m.draw_ground = draw_mine_cart_rails;
-    m.draw_row    = draw_mine_cart_row;
+    m.setup        = setup_mine_cart;
+    m.tick         = update_mine_cart;
+    m.draw_ground  = draw_mine_cart_rails;
+    m.draw_row     = draw_mine_cart_row;
+    m.draw_overlay = draw_volcanic_overlay;
     return m;
 }
 
@@ -494,8 +496,11 @@ pirate_mechanic :: () -> LevelMechanic {
     m: LevelMechanic;
     m.setup        = setup_pirate;
     m.tick         = tick_pirate;
+    m.draw_ground  = draw_pirate_deck;
     m.draw_row     = draw_cannons_row;
+    m.draw_overlay = draw_pirate_overlay;
     m.on_explosion = on_explosion_pirate;
+    m.tile_blocked = pirate_tile_blocked;
     return m;
 }
 
@@ -734,6 +739,18 @@ MineCart :: struct {
 mine_cart: MineCart;
 mine_cart_path: [..] BFSNode;    // expanded tile-by-tile path (for collisions/ticks)
 
+// Drifting embers fill the volcanic level's air so it reads as a hot mine.
+EMBER_COUNT :: 110;
+Ember :: struct {
+    sx, sy: float;
+    vy: float;       // rises upward (negative pixel delta)
+    size: float;
+    sway: float;
+    hue:  float;     // 0..1 → cooler red → hotter yellow
+}
+embers: [EMBER_COUNT] Ember;
+embers_initialized: bool;
+
 // ─── Level 3 (SNOW) — snowballs ─────────────────────────────────────────────
 SNOWBALL_FORM_TICKS  :: 240;    // 4 s to finish forming
 SNOWBALL_ROLL_DELAY  :: 5;
@@ -772,12 +789,15 @@ snowflakes_initialized: bool;
 CANNON_FUSE_TICKS  :: 90;
 CANNON_RANGE       :: 5;
 CANNON_EDGE_OFFSET :: 2;     // columns from the side wall — 2 keeps back-tile reachable
+CANNON_COOLDOWN_TICKS :: BOMB_TIMER;   // same as a bomb fuse — cools down after firing
+CANNON_FIRE_FLASH_TICKS :: 12;         // brief muzzle-flash window while a shot is hot
 
 Cannon :: struct {
     x, y: int;
     dir: Dir;
-    fuse_timer: int;   // 0 = not lit; counts down once lit
-    fired: bool;
+    fuse_timer:     int;   // 0 = not lit; counts down once lit
+    cooldown_timer: int;   // ticks remaining before this cannon can fire again
+    flash_timer:    int;   // brief muzzle-flash window after firing
 }
 cannons: [..] Cannon;
 
@@ -1313,6 +1333,10 @@ draw_wall_3d :: (c: int, r: int) {
     mort_w :: 2.0;
     draw_quad_3d(.{x0 + 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z + mort_w}, .{x0 + 6, h + 0.1, mid_z + mort_w}, mortar);
     draw_quad_3d(.{mid_x - mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z1 - 6}, .{mid_x - mort_w, h + 0.1, z1 - 6}, mortar);
+
+    // Interior pillars stay quiet — no animated rune on top.
+    if !wall_is_border(c, r) return;
+
     seed := c * 53 + r * 211;
     rune_phase := cast(float)frame_count / 22.0 + cast(float)seed * 0.013;
     rune_pulse := 0.55 + 0.45 * sin(rune_phase);
@@ -1325,6 +1349,11 @@ draw_wall_3d :: (c: int, r: int) {
     dot_z := z0 + cast(float)((seed / 5) % 18) + 8;
     draw_quad_3d(.{dot_x - 0.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z + 3.6}, .{dot_x - 0.6, h + 0.18, dot_z + 3.6}, col(rune_c.x, rune_c.y, rune_c.z, 0.30 * rune_pulse));
     draw_quad_3d(.{dot_x, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z + 3}, .{dot_x, h + 0.22, dot_z + 3}, rune_c);
+
+    // Border crowns: a second smaller rune dot for a more "decorated edge" feel.
+    dot2_x := x0 + cast(float)((seed * 7) % 18) + 22;
+    dot2_z := z0 + cast(float)((seed * 11 / 5) % 18) + 22;
+    draw_quad_3d(.{dot2_x, h + 0.22, dot2_z}, .{dot2_x + 2, h + 0.22, dot2_z}, .{dot2_x + 2, h + 0.22, dot2_z + 2}, .{dot2_x, h + 0.22, dot2_z + 2}, col(rune_c.x, rune_c.y, rune_c.z, rune_pulse * 0.85));
 }
 
 draw_brick_3d :: (c: int, r: int) {
@@ -1385,6 +1414,13 @@ wall_top_screen :: (c: int, r: int, height_frac: float = 1.0) -> sx: float, sy: 
     return sc.x, sc.y, s;
 }
 
+// Border walls (the ring around the arena) carry the showy ornaments — they
+// frame the playfield. Interior pillars are the lattice at every (even, even)
+// tile; they get a stripped-down look so they don't distract from gameplay.
+wall_is_border :: (c: int, r: int) -> bool {
+    return c == 0 || c == COLS - 1 || r == 0 || r == ROWS - 1;
+}
+
 draw_wall_volcanic :: (c: int, r: int) {
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
@@ -1400,31 +1436,35 @@ draw_wall_volcanic :: (c: int, r: int) {
     z0 := cz_w - half;
     z1 := cz_w + half;
 
-    // Glowing magma vein running across the top face.
+    border := wall_is_border(c, r);
     seed := c * 73 + r * 211;
+
+    // Glowing magma vein across the top face — same shape both border and
+    // interior, but border veins pulse hotter so the edge feels alive.
     pulse := 0.65 + 0.35 * sin(cast(float)frame_count / 8.0 + cast(float)seed * 0.04);
-    vein  := col(1.0, 0.45 * pulse + 0.30, 0.15 * pulse, 1);
-    // Horizontal-ish vein with slight offset.
+    vein_a := ifx border then pulse else 0.55;
+    vein  := col(1.0, 0.45 * pulse + 0.30, 0.15 * pulse, vein_a);
     voff := cast(float)((seed % 16) - 8);
     draw_quad_3d(.{x0 + 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
                  .{x1 - 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
                  .{x1 - 6, h + 0.08, cz_w + 1.5 + voff * 0.2},
                  .{x0 + 6, h + 0.08, cz_w + 1.5 + voff * 0.2}, vein);
-    // Bright hot core line on top of the vein.
-    core := col(1.0, 0.92, 0.70, pulse);
-    draw_quad_3d(.{x0 + 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
-                 .{x1 - 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
-                 .{x1 - 8, h + 0.14, cz_w + 0.4 + voff * 0.2},
-                 .{x0 + 8, h + 0.14, cz_w + 0.4 + voff * 0.2}, core);
+    if border {
+        core := col(1.0, 0.92, 0.70, pulse);
+        draw_quad_3d(.{x0 + 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                     .{x1 - 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                     .{x1 - 8, h + 0.14, cz_w + 0.4 + voff * 0.2},
+                     .{x0 + 8, h + 0.14, cz_w + 0.4 + voff * 0.2}, core);
+    }
 
-    // Lava drip from top edge of the front face.
+    if !border return;
+
+    // Lava drip from top edge of the front face — border-only flourish.
     drip_x := x0 + 10 + cast(float)((seed * 3) % 30);
     drip_top  := col(1.0, 0.55, 0.18, 1);
     drip_glow := col(1.0, 0.30, 0.10, 0.55);
     drip_h := cast(float)TILE * (0.18 + 0.08 * sin(cast(float)frame_count / 7.0 + cast(float)seed * 0.1));
-    // Glow halo
     draw_quad_3d(.{drip_x - 3, h - drip_h, z1 + 0.1}, .{drip_x + 5, h - drip_h, z1 + 0.1}, .{drip_x + 5, h, z1 + 0.1}, .{drip_x - 3, h, z1 + 0.1}, drip_glow);
-    // Drip body
     draw_quad_3d(.{drip_x, h - drip_h, z1 + 0.15}, .{drip_x + 2, h - drip_h, z1 + 0.15}, .{drip_x + 2.5, h, z1 + 0.15}, .{drip_x - 0.5, h, z1 + 0.15}, drip_top);
 
     // Floating ember above the wall (2D billboard).
@@ -1435,6 +1475,89 @@ draw_wall_volcanic :: (c: int, r: int) {
     a := 0.65 + 0.35 * sin(ember_phase * 2.0);
     draw_filled_circle(sx + ex_off, sy - 14 + ey_off, 4.0 * s, col(1.0, 0.45, 0.15, a * 0.55), 10);
     draw_filled_circle(sx + ex_off, sy - 14 + ey_off, 2.2 * s, col(1.0, 0.85, 0.45, a),         8);
+}
+
+// Mine rubble with a glowing ore vein on the top face — gives bricks a clear
+// "this is the inside of a volcano mine" read instead of plain weathered stone.
+draw_brick_volcanic :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    h := cast(float)TILE * 0.72;
+    half := cast(float)TILE * 0.45;
+    base := col(0.28, 0.17, 0.10, 1);
+    top  := col(0.50, 0.32, 0.18, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Dark rim and chiseled facets sell "broken volcanic rock".
+    rim := col(0.14, 0.08, 0.04, 1);
+    rim_w :: 2.4;
+    draw_quad_3d(.{x0, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z0 + rim_w}, .{x0, h + 0.05, z0 + rim_w}, rim);
+    draw_quad_3d(.{x0, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
+    draw_quad_3d(.{x0, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
+    draw_quad_3d(.{x1 - rim_w, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z1}, .{x1 - rim_w, h + 0.05, z1}, rim);
+
+    seed := c * 47 + r * 19;
+    pulse := 0.55 + 0.45 * sin(cast(float)frame_count / 9.0 + cast(float)seed * 0.05);
+
+    // Pulsing ore vein crossing the top face diagonally — the "live magma in
+    // the rock" hook the level was missing.
+    vein_d := col(1.0, 0.30, 0.08, 0.85);
+    vein_h := col(1.0, 0.92, 0.60, pulse);
+    voff := cast(float)((seed % 12) - 6);
+    draw_quad_3d(.{x0 + 6, h + 0.10, cz_w - 2 + voff * 0.3},
+                 .{x1 - 6, h + 0.10, cz_w - 2 + voff * 0.3},
+                 .{x1 - 6, h + 0.10, cz_w + 2 + voff * 0.3},
+                 .{x0 + 6, h + 0.10, cz_w + 2 + voff * 0.3}, vein_d);
+    draw_quad_3d(.{x0 + 10, h + 0.16, cz_w - 0.6 + voff * 0.3},
+                 .{x1 - 10, h + 0.16, cz_w - 0.6 + voff * 0.3},
+                 .{x1 - 10, h + 0.16, cz_w + 0.6 + voff * 0.3},
+                 .{x0 + 10, h + 0.16, cz_w + 0.6 + voff * 0.3}, vein_h);
+
+    // Ore flecks on the front face — looks like embedded mineral.
+    flec := col(1.0, 0.65, 0.20, 1);
+    for i: 0..2 {
+        fx := x0 + 6 + cast(float)((seed * (i + 3)) % 26);
+        fy := h * 0.25 + cast(float)((seed * (i + 5)) % 30) * 0.4;
+        draw_quad_3d(.{fx, fy, z1 + 0.1}, .{fx + 2.4, fy, z1 + 0.1}, .{fx + 2.4, fy + 2.4, z1 + 0.1}, .{fx, fy + 2.4, z1 + 0.1}, flec);
+    }
+}
+
+// Drifting embers + heat shimmer — the cheap, unmistakable "this is a
+// volcanic mine" cue. Wired into volcanic_mechanic.draw_overlay.
+draw_volcanic_overlay :: () {
+    vw := cast(float)WINDOW_W;
+    vh := cast(float)WINDOW_H;
+    if !embers_initialized {
+        for i: 0..EMBER_COUNT - 1 {
+            e := *embers[i];
+            e.sx = random_get_zero_to_one() * vw;
+            e.sy = random_get_zero_to_one() * vh;
+            e.vy = 0.4 + random_get_zero_to_one() * 1.2;
+            e.size = 0.8 + random_get_zero_to_one() * 1.8;
+            e.sway = random_get_zero_to_one() * TAU;
+            e.hue  = random_get_zero_to_one();
+        }
+        embers_initialized = true;
+    }
+    for * e: embers {
+        e.sy -= e.vy;
+        e.sx += sin(e.sway + cast(float)frame_count / 22.0) * 0.55;
+        if e.sy < -8 { e.sy = vh + 6; e.sx = random_get_zero_to_one() * vw; }
+        if e.sx > vw + 8 e.sx = -8;
+        if e.sx < -8     e.sx = vw + 8;
+        // Hotter embers (high hue) skew yellow-white; cooler ones stay red.
+        r := 1.0;
+        g := 0.35 + e.hue * 0.55;
+        b := 0.10 + e.hue * 0.35;
+        a := 0.55 + 0.35 * sin(e.sway + cast(float)frame_count / 7.0);
+        draw_filled_circle(e.sx, e.sy, e.size * 2.4, col(r, g * 0.7, b * 0.5, a * 0.18), 6);
+        draw_filled_circle(e.sx, e.sy, e.size,       col(r, g,       b,       a),         6);
+    }
 }
 
 draw_wall_snow :: (c: int, r: int) {
@@ -1449,6 +1572,9 @@ draw_wall_snow :: (c: int, r: int) {
     // Wider snow cap.
     cap_h := h_body + cast(float)TILE * 0.10;
     draw_cube_3d(cx_w, cz_w, half - 1.5, cap_h, col(1, 1, 1, 1), col(0.88, 0.95, 1.00, 1));
+
+    // Interior pillars stop at the snow cap — the snowman is a border-only treat.
+    if !wall_is_border(c, r) return;
 
     // Snowman head perched on top — a clear "cute thing".
     seed := c * 73 + r * 137;
@@ -1528,6 +1654,10 @@ draw_wall_pirate :: (c: int, r: int) {
         draw_quad_3d(.{px - 0.8, 0.05, z1 + 0.1}, .{px + 0.8, 0.05, z1 + 0.1}, .{px + 0.8, h - 0.05, z1 + 0.1}, .{px - 0.8, h - 0.05, z1 + 0.1}, seam);
     }
 
+    // Interior pillars on the cannon deck stay quiet — no rope, flag, or
+    // pulsing brass to distract from the cannon fire lanes.
+    if !wall_is_border(c, r) return;
+
     seed := c * 41 + r * 73;
     sx, sy, s := wall_top_screen(c, r, 1.0);
 
@@ -1568,6 +1698,15 @@ draw_wall_pirate :: (c: int, r: int) {
 }
 
 draw_brick_pirate :: (c: int, r: int) {
+    seed := c * 7 + r * 11;
+    // Half the bricks render as wooden barrels (round silhouette, brass
+    // hoops) instead of crates — a 50/50 mix gives the deck a "cargo
+    // strewn across the boards" look instead of an endless crate maze.
+    if (seed % 2) == 0 {
+        draw_brick_pirate_barrel(c, r, seed);
+        return;
+    }
+
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
     h := cast(float)TILE * 0.70;
@@ -1603,10 +1742,72 @@ draw_brick_pirate :: (c: int, r: int) {
     label_bg := col(0.86, 0.78, 0.52, 1);
     label_edge := col(0.40, 0.30, 0.16, 1);
     fy := h * 0.40;
-    seed := c * 7 + r * 11;
     off := cast(float)((seed % 8) - 4);
     draw_quad_3d(.{cx_w - 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy + 9, z1 + 0.1}, .{cx_w - 9 + off, fy + 9, z1 + 0.1}, label_edge);
     draw_quad_3d(.{cx_w - 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy + 8, z1 + 0.15}, .{cx_w - 8 + off, fy + 8, z1 + 0.15}, label_bg);
+}
+
+// Wooden cargo barrel — three brass hoops + tapered staves on the front
+// face, a circular plank lid on top. Stands in for half the destructibles
+// on the pirate deck so the level reads as ship cargo, not crates only.
+draw_brick_pirate_barrel :: (c: int, r: int, seed: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    h    := cast(float)TILE * 0.72;
+    half := cast(float)TILE * 0.40;
+    base := col(0.42, 0.26, 0.14, 1);
+    top  := col(0.66, 0.46, 0.24, 1);
+    draw_cube_3d(cx_w, cz_w, half, h, top, base);
+
+    x0 := cx_w - half;
+    x1 := cx_w + half;
+    z0 := cz_w - half;
+    z1 := cz_w + half;
+
+    // Brass hoops banding the front face — three horizontal stripes.
+    hoop_d := col(0.62, 0.40, 0.16, 1);
+    hoop_h := col(1.00, 0.82, 0.40, 1);
+    for i: 0..2 {
+        hy := h * (0.15 + cast(float)i * 0.34);
+        draw_quad_3d(.{x0 + 1, hy,        z1 + 0.10}, .{x1 - 1, hy,        z1 + 0.10},
+                     .{x1 - 1, hy + 2.4,  z1 + 0.10}, .{x0 + 1, hy + 2.4,  z1 + 0.10}, hoop_d);
+        draw_quad_3d(.{x0 + 1, hy + 0.6,  z1 + 0.13}, .{x1 - 1, hy + 0.6,  z1 + 0.13},
+                     .{x1 - 1, hy + 1.2,  z1 + 0.13}, .{x0 + 1, hy + 1.2,  z1 + 0.13}, hoop_h);
+    }
+
+    // Vertical stave shading on the face — three subtle dark lines.
+    stave := col(0.22, 0.12, 0.06, 0.65);
+    for i: 1..3 {
+        sxv := x0 + cast(float)TILE * cast(float) i / 4.0;
+        draw_quad_3d(.{sxv - 0.5, 1, z1 + 0.08}, .{sxv + 0.5, 1, z1 + 0.08},
+                     .{sxv + 0.5, h - 1, z1 + 0.08}, .{sxv - 0.5, h - 1, z1 + 0.08}, stave);
+    }
+
+    // Top lid — concentric darker ring + center plug.
+    lid_inset := 3.0;
+    lid_dark  := col(0.30, 0.18, 0.08, 1);
+    lid_mid   := col(0.58, 0.40, 0.20, 1);
+    plug      := col(0.20, 0.12, 0.06, 1);
+    draw_quad_3d(.{x0 + lid_inset,        h + 0.04, z0 + lid_inset},
+                 .{x1 - lid_inset,        h + 0.04, z0 + lid_inset},
+                 .{x1 - lid_inset,        h + 0.04, z1 - lid_inset},
+                 .{x0 + lid_inset,        h + 0.04, z1 - lid_inset}, lid_dark);
+    li2 := lid_inset + 3.0;
+    draw_quad_3d(.{x0 + li2, h + 0.08, z0 + li2},
+                 .{x1 - li2, h + 0.08, z0 + li2},
+                 .{x1 - li2, h + 0.08, z1 - li2},
+                 .{x0 + li2, h + 0.08, z1 - li2}, lid_mid);
+    // Center plug
+    cp := 4.5;
+    draw_quad_3d(.{cx_w - cp, h + 0.12, cz_w - cp},
+                 .{cx_w + cp, h + 0.12, cz_w - cp},
+                 .{cx_w + cp, h + 0.12, cz_w + cp},
+                 .{cx_w - cp, h + 0.12, cz_w + cp}, plug);
+    // Crosshair on the plug
+    draw_quad_3d(.{cx_w - cp, h + 0.14, cz_w - 0.5}, .{cx_w + cp, h + 0.14, cz_w - 0.5},
+                 .{cx_w + cp, h + 0.14, cz_w + 0.5}, .{cx_w - cp, h + 0.14, cz_w + 0.5}, lid_dark);
+    draw_quad_3d(.{cx_w - 0.5, h + 0.14, cz_w - cp}, .{cx_w + 0.5, h + 0.14, cz_w - cp},
+                 .{cx_w + 0.5, h + 0.14, cz_w + cp}, .{cx_w - 0.5, h + 0.14, cz_w + cp}, lid_dark);
 }
 
 draw_wall_beach :: (c: int, r: int) {
@@ -1628,6 +1829,9 @@ draw_wall_beach :: (c: int, r: int) {
         gy := h * cast(float)i / 4.0;
         draw_quad_3d(.{x0 + 3, gy, z1 + 0.1}, .{x1 - 3, gy, z1 + 0.1}, .{x1 - 3, gy + 0.8, z1 + 0.1}, .{x0 + 3, gy + 0.8, z1 + 0.1}, grain);
     }
+
+    // Interior pillars get the wood post without the ornament on top.
+    if !wall_is_border(c, r) return;
 
     seed := c * 23 + r * 41;
     sx, sy, s := wall_top_screen(c, r, 0.92);
@@ -2921,6 +3125,26 @@ draw_mine_cart :: (cx: float, cy: float) {
     // Front lip
     draw_filled_rect(cx - 22, by + 0, 44, 3, iron);
 
+    // Coal + ore in the cart bed — only visible when nobody is aboard,
+    // otherwise the rider would sit on top of the load.
+    if mine_cart.state == .IDLE {
+        coal_d := col(0.06, 0.05, 0.05, 1);
+        coal_m := col(0.20, 0.18, 0.18, 1);
+        ore    := col(1.00, 0.55, 0.18, 1);
+        ore_h  := col(1.00, 0.85, 0.50, 1);
+        ore_pulse := 0.55 + 0.45 * sin(cast(float)frame_count / 12.0);
+        // Heap of coal lumps
+        draw_filled_circle(cx - 10, by - 6, 6.5, coal_d, 10);
+        draw_filled_circle(cx,      by - 9, 7.0, coal_d, 10);
+        draw_filled_circle(cx + 10, by - 6, 6.0, coal_d, 10);
+        draw_filled_circle(cx - 10, by - 7, 4.0, coal_m, 8);
+        draw_filled_circle(cx +  1, by - 10, 4.5, coal_m, 8);
+        // Glowing ore chunk peeking out of the pile
+        draw_filled_circle(cx + 4, by - 7, 4.2 * ore_pulse, col(ore.x, ore.y * 0.7, ore.z * 0.4, 0.55), 8);
+        draw_filled_circle(cx + 4, by - 7, 2.4, ore, 8);
+        draw_filled_circle(cx + 4, by - 7, 1.2, ore_h, 6);
+    }
+
     // Wheels — two big visible.
     for i: 0..1 {
         wx := cx - 14 + cast(float)i * 28;
@@ -2936,6 +3160,36 @@ draw_mine_cart :: (cx: float, cy: float) {
             draw_line(wx, wy, sx, sy, rim, 1.2);
         }
     }
+
+    // Swinging miner's lantern hung from a post — the "mine" tell that reads
+    // from across the screen. Sway picks up when the cart is rolling.
+    sway_amp := ifx mine_cart.state == .RIDING then 6.0 else 1.4;
+    sway_rate := ifx mine_cart.state == .RIDING then 5.0 else 12.0;
+    swing := sin(cast(float)frame_count / sway_rate) * sway_amp;
+    post_top_x := cx + 22;
+    post_top_y := by - 30;
+    post_bot_x := cx + 22;
+    post_bot_y := by - 18;
+    draw_line(post_bot_x, post_bot_y, post_top_x, post_top_y, iron, 1.6);
+    draw_line(post_top_x, post_top_y, post_top_x - 6, post_top_y, iron, 1.6);  // hook
+    lantern_x := post_top_x - 6 + swing;
+    lantern_y := post_top_y + 10;
+    // Lantern halo
+    lantern_pulse := 0.75 + 0.25 * sin(cast(float)frame_count / 6.0);
+    for i: 0..2 {
+        rr := 12.0 + cast(float)i * 6.0;
+        a  := (0.32 - cast(float)i * 0.10) * lantern_pulse;
+        draw_filled_circle(lantern_x, lantern_y, rr, col(1.0, 0.78, 0.30, a), 12);
+    }
+    // Chain
+    draw_line(post_top_x - 6, post_top_y, lantern_x, lantern_y - 6, col(0.30, 0.22, 0.12, 1), 1.0);
+    // Lantern body
+    draw_filled_rect(lantern_x - 4, lantern_y - 6, 8, 2, iron);
+    draw_rounded_rect(lantern_x - 5, lantern_y - 4, 10, 9, 2, iron);
+    draw_filled_rect(lantern_x - 3.5, lantern_y - 2.5, 7, 6, col(1.0, 0.75, 0.30, 1));
+    // Flame inside
+    flick := 0.6 + 0.4 * sin(cast(float)frame_count / 3.0);
+    draw_filled_circle(lantern_x, lantern_y + 0.5, 2.0 * flick, col(1.0, 0.95, 0.55, 1), 8);
 
     // Idle: subtle pulse hinting "you can ride this".
     if mine_cart.state == .IDLE {
@@ -3316,6 +3570,11 @@ update_mine_cart :: () {
 
     if mine_cart.state != .RIDING return;
 
+    // Squash any non-rider entity who walked onto the cart's tile between
+    // cart moves — without this, enemies (and the player) can sidestep into
+    // the cart and survive the wheels.
+    cart_hit_tile(mine_cart.x, mine_cart.y);
+
     // Snap the rider's grid + render position to the cart.
     if mine_cart.rider == .PLAYER {
         player.x  = mine_cart.x;
@@ -3363,6 +3622,13 @@ player_is_riding :: () -> bool {
     return mine_cart.state == .RIDING && mine_cart.rider == .PLAYER;
 }
 
+// True when enemy `ei` is currently aboard the mine cart. Used by every
+// damage path so a rider can't be killed on the spot — the cart is a safe
+// space while you're aboard.
+enemy_is_riding :: (ei: int) -> bool {
+    return mine_cart.state == .RIDING && mine_cart.rider == .ENEMY && mine_cart.rider_enemy_id == ei;
+}
+
 player_is_busy :: () -> bool {
     // True when the player can't act (mid hop arc, stunned, or owned by a
     // level mechanic — cart ride, fish swallow, etc).
@@ -3390,7 +3656,7 @@ snow_tile_blocked :: (x: int, y: int) -> bool {
 // Kill any non-airborne entity standing on (x, y). Used by snowballs when
 // rolling onto a tile.
 snowball_squish_at :: (x: int, y: int) {
-    if !player.hopping && game_over_delay == 0 && player.x == x && player.y == y {
+    if !player.hopping && !player_is_riding() && game_over_delay == 0 && player.x == x && player.y == y {
         spawn_death_fx(player.rx, player.ry, col(0.353, 0.604, 0.965, 1), true);
         game_over_delay = 50;
         hit_flash_timer = 22;
@@ -3401,6 +3667,7 @@ snowball_squish_at :: (x: int, y: int) {
     for * en, ei: enemies {
         if !en.alive continue;
         if en.hopping continue;
+        if enemy_is_riding(ei) continue;
         if en.x == x && en.y == y {
             en.alive = false;
             spawn_death_fx(en.rx, en.ry, en.glow, true);
@@ -3604,12 +3871,16 @@ setup_pirate :: () {
 
 tick_pirate :: () {
     for * cn: cannons {
-        if cn.fired continue;
+        if cn.cooldown_timer > 0 cn.cooldown_timer -= 1;
+        if cn.flash_timer > 0    cn.flash_timer    -= 1;
         if cn.fuse_timer <= 0 continue;
         cn.fuse_timer -= 1;
         if cn.fuse_timer <= 0 {
-            // Fire — spawn explosion tiles along the firing direction.
-            cn.fired = true;
+            // Fire — spawn explosion tiles along the firing direction, then
+            // enter a cooldown the length of a bomb fuse before this cannon
+            // can be lit again.
+            cn.cooldown_timer = CANNON_COOLDOWN_TICKS;
+            cn.flash_timer    = CANNON_FIRE_FLASH_TICKS;
             dx, dy := dir_offset(cn.dir);
             for k: 1..CANNON_RANGE {
                 nx := cn.x + dx * k;
@@ -3640,8 +3911,8 @@ tick_pirate :: () {
 on_explosion_pirate :: (bx: int, by: int, range: int) {
     // Light any cannon whose back tile lies in this bomb's blast pattern.
     for * cn: cannons {
-        if cn.fired continue;
         if cn.fuse_timer > 0 continue;
+        if cn.cooldown_timer > 0 continue;
         dx, dy := dir_offset(cn.dir);
         back_x := cn.x - dx;
         back_y := cn.y - dy;
@@ -3653,64 +3924,308 @@ on_explosion_pirate :: (bx: int, by: int, range: int) {
     }
 }
 
+// Cannons sit on their tile and block both the player and enemies from
+// walking through. Combined with on_explosion_pirate's back-tile check, this
+// keeps the back-row bomb slot as the only way to trigger a shot.
+pirate_tile_blocked :: (x: int, y: int) -> bool {
+    for cn: cannons {
+        if cn.x == x && cn.y == y return true;
+    }
+    return false;
+}
+
 draw_cannon_billboard :: (cx: float, cy: float, cn: Cannon) {
-    body_d := col(0.16, 0.16, 0.18, 1);
-    body_m := col(0.34, 0.34, 0.40, 1);
-    body_h := col(0.62, 0.62, 0.72, 1);
-    // Drop shadow
-    draw_filled_ellipse(cx, cy + 9, 24, 7, col(0, 0, 0, 0.50));
-    // Body box
-    draw_rounded_rect(cx - 14, cy - 7, 28, 16, 4, body_d);
-    draw_rounded_rect(cx - 13, cy - 6, 26, 14, 3, body_m);
-    draw_filled_rect(cx - 12, cy - 5, 24, 2, body_h);
-    // Barrel oriented by direction
+    // Beefier silhouette than the old 28×16 box. Sized to feel as imposing
+    // on the field as a powerup gem — wide cast-iron carriage with brass
+    // bands, big muzzle, and a glowing armed/cooldown halo.
+    armed    := cn.fuse_timer == 0 && cn.cooldown_timer == 0;
+    cooling  := cn.cooldown_timer > 0;
+    firing   := cn.flash_timer > 0;
+
+    halo_pulse := 0.65 + 0.35 * sin(cast(float)frame_count / 18.0);
+    if armed {
+        // Subtle warm halo when ready to fire — the "I'm armed" tell.
+        for i: 0..2 {
+            rr := 28.0 + cast(float)i * 8.0;
+            a  := (0.30 - cast(float)i * 0.08) * halo_pulse;
+            draw_filled_ellipse(cx, cy + 4, rr, rr * 0.40, col(0.95, 0.60, 0.20, a), 18);
+        }
+    } else if cooling {
+        // Cold steel-blue halo while recovering.
+        cool_t := cast(float) cn.cooldown_timer / cast(float) CANNON_COOLDOWN_TICKS;
+        for i: 0..2 {
+            rr := 24.0 + cast(float)i * 7.0;
+            a  := (0.22 - cast(float)i * 0.06) * cool_t;
+            draw_filled_ellipse(cx, cy + 4, rr, rr * 0.40, col(0.40, 0.55, 0.75, a), 18);
+        }
+    }
+
+    // Deeper drop shadow under a heavier body.
+    draw_filled_ellipse(cx, cy + 14, 32, 9, col(0, 0, 0, 0.55));
+
+    // Carriage wheels (always two visible from the side; for up/down cannons
+    // we draw them on the body sides too).
+    wheel_d := col(0.10, 0.07, 0.05, 1);
+    wheel_m := col(0.32, 0.22, 0.12, 1);
+    wheel_h := col(0.62, 0.46, 0.22, 1);
+    draw_wheel :: (wx: float, wy: float, dd: Vector4, mm: Vector4, hh: Vector4) #expand {
+        draw_filled_circle(wx, wy, 6.5, dd, 14);
+        draw_filled_circle(wx, wy, 5.0, mm, 14);
+        draw_filled_circle(wx, wy, 1.5, hh, 8);
+        draw_filled_rect(wx - 5, wy - 0.6, 10, 1.2, dd);
+        draw_filled_rect(wx - 0.6, wy - 5, 1.2, 10, dd);
+    }
+    draw_wheel(cx - 14, cy + 9, wheel_d, wheel_m, wheel_h);
+    draw_wheel(cx + 14, cy + 9, wheel_d, wheel_m, wheel_h);
+
+    // Cast-iron carriage body — wider and taller than the old version.
+    body_d := col(0.10, 0.10, 0.13, 1);
+    body_m := col(0.26, 0.26, 0.32, 1);
+    body_h := col(0.55, 0.55, 0.65, 1);
+    brass  := col(0.72, 0.52, 0.18, 1);
+    brass_h:= col(1.00, 0.85, 0.45, 1);
+    if cooling {
+        // Slight cool tint to the carriage while recovering.
+        body_m = col(0.22, 0.24, 0.30, 1);
+    }
+    draw_rounded_rect(cx - 20, cy - 10, 40, 22, 6, body_d);
+    draw_rounded_rect(cx - 19, cy -  9, 38, 20, 5, body_m);
+    // Top highlight strip
+    draw_filled_rect(cx - 17, cy - 8, 34, 3, body_h);
+    // Brass bands
+    draw_filled_rect(cx - 19, cy - 2, 38, 2, brass);
+    draw_filled_rect(cx - 19, cy + 4, 38, 2, brass);
+    // Center brass rivet (the "imposing" focal stud)
+    draw_filled_circle(cx, cy + 1, 3.2, brass);
+    draw_filled_circle(cx, cy + 1, 1.6, brass_h, 8);
+
+    // Barrel — fatter, longer, with muzzle ring and bore. Oriented per Dir.
+    barrel_d := col(0.08, 0.08, 0.10, 1);
+    barrel_m := col(0.22, 0.22, 0.26, 1);
+    barrel_h := col(0.50, 0.50, 0.58, 1);
+    bore_c   := col(0.04, 0.03, 0.03, 1);
+    muzzle_r := col(0.78, 0.56, 0.20, 1);
+    // Active muzzle flash colors
+    flash_a := ifx firing then cast(float) cn.flash_timer / cast(float) CANNON_FIRE_FLASH_TICKS else 0.0;
+
     if cn.dir == {
         case .UP;
-            draw_filled_rect(cx - 5, cy - 24, 10, 20, body_d);
-            draw_filled_rect(cx - 4, cy - 23, 8, 18, body_m);
-            draw_filled_circle(cx, cy - 24, 5, body_d, 12);
-            draw_filled_circle(cx, cy - 24, 3, col(0.06, 0.05, 0.05, 1), 10);
+            // Trunnion bolt
+            draw_filled_circle(cx, cy - 7, 4.5, brass, 12);
+            draw_filled_circle(cx, cy - 7, 2.5, brass_h, 10);
+            // Barrel body
+            draw_rounded_rect(cx - 8, cy - 32, 16, 28, 4, barrel_d);
+            draw_rounded_rect(cx - 7, cy - 31, 14, 26, 3, barrel_m);
+            draw_filled_rect(cx - 5, cy - 30, 3, 24, barrel_h);  // highlight strip
+            // Muzzle ring + bore
+            draw_filled_circle(cx, cy - 32, 9, barrel_d, 14);
+            draw_filled_circle(cx, cy - 32, 7.5, muzzle_r, 14);
+            draw_filled_circle(cx, cy - 32, 6, barrel_m, 14);
+            draw_filled_circle(cx, cy - 32, 4, bore_c, 12);
+            if flash_a > 0 {
+                draw_filled_circle(cx, cy - 40, 14 * flash_a, col(1.0, 0.70, 0.25, 0.5 * flash_a), 14);
+                draw_filled_circle(cx, cy - 38, 8  * flash_a, col(1.0, 0.95, 0.65, 0.95 * flash_a), 12);
+            }
         case .DOWN;
-            draw_filled_rect(cx - 5, cy + 4, 10, 20, body_d);
-            draw_filled_rect(cx - 4, cy + 5, 8, 18, body_m);
-            draw_filled_circle(cx, cy + 24, 5, body_d, 12);
-            draw_filled_circle(cx, cy + 24, 3, col(0.06, 0.05, 0.05, 1), 10);
+            draw_filled_circle(cx, cy + 7, 4.5, brass, 12);
+            draw_filled_circle(cx, cy + 7, 2.5, brass_h, 10);
+            draw_rounded_rect(cx - 8, cy + 4, 16, 28, 4, barrel_d);
+            draw_rounded_rect(cx - 7, cy + 5, 14, 26, 3, barrel_m);
+            draw_filled_rect(cx - 5, cy + 6, 3, 24, barrel_h);
+            draw_filled_circle(cx, cy + 32, 9, barrel_d, 14);
+            draw_filled_circle(cx, cy + 32, 7.5, muzzle_r, 14);
+            draw_filled_circle(cx, cy + 32, 6, barrel_m, 14);
+            draw_filled_circle(cx, cy + 32, 4, bore_c, 12);
+            if flash_a > 0 {
+                draw_filled_circle(cx, cy + 40, 14 * flash_a, col(1.0, 0.70, 0.25, 0.5 * flash_a), 14);
+                draw_filled_circle(cx, cy + 38, 8  * flash_a, col(1.0, 0.95, 0.65, 0.95 * flash_a), 12);
+            }
         case .LEFT;
-            draw_filled_rect(cx - 24, cy - 5, 20, 10, body_d);
-            draw_filled_rect(cx - 23, cy - 4, 18, 8, body_m);
-            draw_filled_circle(cx - 24, cy, 5, body_d, 12);
-            draw_filled_circle(cx - 24, cy, 3, col(0.06, 0.05, 0.05, 1), 10);
+            draw_filled_circle(cx - 7, cy, 4.5, brass, 12);
+            draw_filled_circle(cx - 7, cy, 2.5, brass_h, 10);
+            draw_rounded_rect(cx - 32, cy - 8, 28, 16, 4, barrel_d);
+            draw_rounded_rect(cx - 31, cy - 7, 26, 14, 3, barrel_m);
+            draw_filled_rect(cx - 30, cy - 5, 24, 3, barrel_h);
+            draw_filled_circle(cx - 32, cy, 9, barrel_d, 14);
+            draw_filled_circle(cx - 32, cy, 7.5, muzzle_r, 14);
+            draw_filled_circle(cx - 32, cy, 6, barrel_m, 14);
+            draw_filled_circle(cx - 32, cy, 4, bore_c, 12);
+            if flash_a > 0 {
+                draw_filled_circle(cx - 40, cy, 14 * flash_a, col(1.0, 0.70, 0.25, 0.5 * flash_a), 14);
+                draw_filled_circle(cx - 38, cy, 8  * flash_a, col(1.0, 0.95, 0.65, 0.95 * flash_a), 12);
+            }
         case .RIGHT;
-            draw_filled_rect(cx + 4, cy - 5, 20, 10, body_d);
-            draw_filled_rect(cx + 5, cy - 4, 18, 8, body_m);
-            draw_filled_circle(cx + 24, cy, 5, body_d, 12);
-            draw_filled_circle(cx + 24, cy, 3, col(0.06, 0.05, 0.05, 1), 10);
+            draw_filled_circle(cx + 7, cy, 4.5, brass, 12);
+            draw_filled_circle(cx + 7, cy, 2.5, brass_h, 10);
+            draw_rounded_rect(cx + 4, cy - 8, 28, 16, 4, barrel_d);
+            draw_rounded_rect(cx + 5, cy - 7, 26, 14, 3, barrel_m);
+            draw_filled_rect(cx + 6, cy - 5, 24, 3, barrel_h);
+            draw_filled_circle(cx + 32, cy, 9, barrel_d, 14);
+            draw_filled_circle(cx + 32, cy, 7.5, muzzle_r, 14);
+            draw_filled_circle(cx + 32, cy, 6, barrel_m, 14);
+            draw_filled_circle(cx + 32, cy, 4, bore_c, 12);
+            if flash_a > 0 {
+                draw_filled_circle(cx + 40, cy, 14 * flash_a, col(1.0, 0.70, 0.25, 0.5 * flash_a), 14);
+                draw_filled_circle(cx + 38, cy, 8  * flash_a, col(1.0, 0.95, 0.65, 0.95 * flash_a), 12);
+            }
     }
+
+    // Drifting smoke wisps while cooling down — clear visual "not yet" cue.
+    if cooling {
+        cool_t := cast(float) cn.cooldown_timer / cast(float) CANNON_COOLDOWN_TICKS;
+        // Smoke rises from the muzzle in the cannon's facing direction.
+        mx, my: float;
+        if cn.dir == {
+            case .UP;    mx = cx;       my = cy - 32;
+            case .DOWN;  mx = cx;       my = cy + 32;
+            case .LEFT;  mx = cx - 32;  my = cy;
+            case .RIGHT; mx = cx + 32;  my = cy;
+        }
+        for i: 0..2 {
+            phase := cast(float)((frame_count + i * 13) % 60) / 60.0;
+            rad   := 3.0 + phase * 6.0;
+            a     := (1.0 - phase) * 0.45 * cool_t;
+            draw_filled_circle(mx + (cast(float)i - 1) * 2.0, my - phase * 18.0, rad, col(0.55, 0.55, 0.60, a), 10);
+        }
+    }
+
     // Fuse spark at the back tile when lit
-    if cn.fuse_timer > 0 && !cn.fired {
+    if cn.fuse_timer > 0 {
         flicker := 0.6 + 0.4 * sin(cast(float)frame_count / 2.5);
         sparkc := col(1.0, 0.78, 0.30, 1);
         bx, by: float;
         if cn.dir == {
-            case .UP;    bx = cx; by = cy + 12;
-            case .DOWN;  bx = cx; by = cy - 12;
-            case .LEFT;  bx = cx + 16; by = cy;
-            case .RIGHT; bx = cx - 16; by = cy;
+            case .UP;    bx = cx; by = cy + 14;
+            case .DOWN;  bx = cx; by = cy - 14;
+            case .LEFT;  bx = cx + 22; by = cy;
+            case .RIGHT; bx = cx - 22; by = cy;
         }
-        draw_filled_circle(bx, by, 5 * flicker, col(1.0, 0.55, 0.20, 0.55), 10);
-        draw_filled_circle(bx, by, 3 * flicker, sparkc, 8);
-        draw_filled_circle(bx, by, 1.5 * flicker, col(1, 1, 1, 1), 6);
+        draw_filled_circle(bx, by, 6 * flicker, col(1.0, 0.55, 0.20, 0.55), 10);
+        draw_filled_circle(bx, by, 4 * flicker, sparkc, 8);
+        draw_filled_circle(bx, by, 2 * flicker, col(1, 1, 1, 1), 6);
     }
 }
 
 draw_cannons_row :: (r: int) {
     for cn: cannons {
         if cn.y != r continue;
-        if cn.fired continue;  // burned through after firing — gone visually
         cx_w := cast(float)(cn.x * TILE) + cast(float)TILE * 0.5;
         cz_w := cast(float)(cn.y * TILE) + cast(float)TILE * 0.5;
         sc, _ := project(.{cx_w, cast(float)TILE * 0.25, cz_w});
         draw_cannon_billboard(sc.x, sc.y, cn);
+    }
+}
+
+// Pirate deck overlay — paints long horizontal plank seams and dark caulk
+// lines across the entire walkable floor so the playfield actually reads as
+// a ship deck instead of generic brown checkerboard. Runs at the
+// `draw_ground` stage so it sits above the floor tiles but below walls,
+// characters, bombs, and the cannons themselves.
+draw_pirate_deck :: () {
+    plank_dark := col(0.18, 0.10, 0.05, 0.80);  // caulk between planks
+    plank_mid  := col(0.32, 0.20, 0.10, 0.45);  // grain ribbon
+    nail       := col(0.74, 0.58, 0.30, 0.85);  // brass deck nail
+
+    // Two caulk lines per tile-row gives a denser plank look than 1 per row.
+    for r: 0..ROWS - 1 {
+        z0 := cast(float)(r * TILE);
+        // Top caulk
+        draw_quad_3d(.{0, 0.4, z0 + cast(float)TILE * 0.33},
+                     .{cast(float)(COLS * TILE), 0.4, z0 + cast(float)TILE * 0.33},
+                     .{cast(float)(COLS * TILE), 0.4, z0 + cast(float)TILE * 0.33 + 1.2},
+                     .{0, 0.4, z0 + cast(float)TILE * 0.33 + 1.2}, plank_dark);
+        // Bottom caulk
+        draw_quad_3d(.{0, 0.4, z0 + cast(float)TILE * 0.66},
+                     .{cast(float)(COLS * TILE), 0.4, z0 + cast(float)TILE * 0.66},
+                     .{cast(float)(COLS * TILE), 0.4, z0 + cast(float)TILE * 0.66 + 1.2},
+                     .{0, 0.4, z0 + cast(float)TILE * 0.66 + 1.2}, plank_dark);
+        // Mid grain ribbon
+        draw_quad_3d(.{0, 0.35, z0 + cast(float)TILE * 0.50},
+                     .{cast(float)(COLS * TILE), 0.35, z0 + cast(float)TILE * 0.50},
+                     .{cast(float)(COLS * TILE), 0.35, z0 + cast(float)TILE * 0.50 + 0.7},
+                     .{0, 0.35, z0 + cast(float)TILE * 0.50 + 0.7}, plank_mid);
+    }
+
+    // Brass deck nails at every plank seam crossing — a low-density pattern
+    // that anchors the eye to the geometry without overwhelming it.
+    for r: 0..ROWS - 1 {
+        for c: 0..COLS - 1 {
+            if (c + r * 3) % 5 != 0 continue;
+            cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+            cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.33;
+            draw_quad_3d(.{cx_w - 1.4, 0.45, cz_w - 1.4},
+                         .{cx_w + 1.4, 0.45, cz_w - 1.4},
+                         .{cx_w + 1.4, 0.45, cz_w + 1.4},
+                         .{cx_w - 1.4, 0.45, cz_w + 1.4}, nail);
+        }
+    }
+}
+
+// Atmospheric pirate overlay — drifting seagulls high in the sky, then a
+// thin sea-spray mist drifting horizontally across the lower playfield. Sells
+// "we are above ocean" without obscuring gameplay.
+GULL_COUNT :: 6;
+Gull :: struct {
+    sx, sy: float;
+    vx: float;
+    flap_phase: float;
+    size: float;
+}
+gulls: [GULL_COUNT] Gull;
+gulls_initialized: bool;
+
+draw_pirate_overlay :: () {
+    vw := cast(float)WINDOW_W;
+    vh := cast(float)WINDOW_H;
+
+    if !gulls_initialized {
+        for i: 0..GULL_COUNT - 1 {
+            g := *gulls[i];
+            g.sx = random_get_zero_to_one() * vw;
+            g.sy = vh * 0.08 + random_get_zero_to_one() * vh * 0.18;
+            g.vx = 0.30 + random_get_zero_to_one() * 0.45;
+            if (i % 2) == 0 g.vx = -g.vx;
+            g.flap_phase = random_get_zero_to_one() * TAU;
+            g.size = 4.0 + random_get_zero_to_one() * 2.5;
+        }
+        gulls_initialized = true;
+    }
+
+    // Sea spray strands drifting horizontally low in the frame — drawn first
+    // so gulls overlay them.
+    for layer: 0..2 {
+        lf := cast(float) layer;
+        ty := vh * 0.78 + lf * 18.0;
+        drift := (cast(float) frame_count * (0.6 + lf * 0.25));
+        for i: 0..7 {
+            t := (cast(float) i / 8.0) * vw + sin(cast(float) frame_count * 0.018 + lf + cast(float) i) * 10.0;
+            wx := cast(float)(cast(int)(t + drift) % cast(int)(vw + 60)) - 30.0;
+            wlen := 40.0 + sin(cast(float) frame_count * 0.04 + lf + cast(float) i) * 14.0;
+            a := (0.10 - lf * 0.025);
+            draw_filled_ellipse(wx, ty, wlen, 2.4, col(0.90, 0.96, 1.00, a), 14);
+        }
+    }
+
+    // Seagulls — simple V-stroke billboards with a flap cycle.
+    for * g: gulls {
+        g.sx += g.vx;
+        g.flap_phase += 0.18;
+        if g.sx > vw + 30 g.sx = -30;
+        if g.sx < -30     g.sx = vw + 30;
+        flap := sin(g.flap_phase) * g.size * 0.55;
+        body := col(0.95, 0.95, 0.95, 0.85);
+        outline := col(0.20, 0.22, 0.28, 0.80);
+        // Two wing strokes form a "M" / shallow V. Direction-aware: facing
+        // matches velocity sign so the gull looks like it's flying forward.
+        sgn := ifx g.vx >= 0 then 1.0 else -1.0;
+        // Wing outline (slightly thicker)
+        draw_line(g.sx - g.size, g.sy + abs(flap) * 0.4, g.sx,          g.sy - flap, outline, 1.8);
+        draw_line(g.sx,          g.sy - flap,            g.sx + g.size, g.sy + abs(flap) * 0.4, outline, 1.8);
+        // Wing body
+        draw_line(g.sx - g.size, g.sy + abs(flap) * 0.4, g.sx,          g.sy - flap, body, 1.0);
+        draw_line(g.sx,          g.sy - flap,            g.sx + g.size, g.sy + abs(flap) * 0.4, body, 1.0);
+        // Tiny head dot in the forward direction
+        draw_filled_circle(g.sx + sgn * 0.6, g.sy - flap * 0.4, 0.9, outline, 5);
     }
 }
 
@@ -3924,6 +4439,7 @@ place_bomb :: () {
     for bombs if it.owner == 0 active_player_bombs += 1;
     if active_player_bombs >= player.max_bombs return;
     for bombs if it.x == player.x && it.y == player.y return;
+    if current_mechanic.tile_blocked && current_mechanic.tile_blocked(player.x, player.y) return;
     b: Bomb;
     b.x = player.x; b.y = player.y;
     b.timer = BOMB_TIMER;
@@ -4481,6 +4997,7 @@ enemy_move_random_safe :: (e: *Enemy) {
 enemy_try_place_bomb :: (e: *Enemy, active_bombs: int, max_escape_steps: int) -> bool {
     if active_bombs >= e.max_bombs return false;
     if is_in_blast(e.x, e.y) return false;
+    if current_mechanic.tile_blocked && current_mechanic.tile_blocked(e.x, e.y) return false;
 
     // A free kill from here? Then loot preservation is off — winning the round
     // matters more than saving a powerup.
@@ -4517,9 +5034,13 @@ enemy_try_place_bomb :: (e: *Enemy, active_bombs: int, max_escape_steps: int) ->
     return true;
 }
 
-update_single_enemy :: (e: *Enemy) {
+update_single_enemy :: (e: *Enemy, ei: int) {
     if !e.alive return;
     if e.hopping return;
+    // Cart riders sit out — their position is driven by the cart, and any AI
+    // action (bomb drop, BFS step) would otherwise litter the rail and fight
+    // the snap in update_mine_cart.
+    if enemy_is_riding(ei) return;
     if e.stun_timer > 0 {
         e.stun_timer -= 1;
         return;
@@ -4678,6 +5199,7 @@ move_player :: (dx: int, dy: int) {
             if sx >= 0 && sx < COLS && sy >= 0 && sy < ROWS && grid[sy][sx] == .EMPTY {
                 blocked := false;
                 for bombs if !it.punching && it_index != bomb_idx && it.x == sx && it.y == sy blocked = true;
+                if current_mechanic.tile_blocked && current_mechanic.tile_blocked(sx, sy) blocked = true;
                 if !blocked {
                     prev_x := player.x;
                     prev_y := player.y;
@@ -4808,7 +5330,10 @@ update :: () {
             should_land := true;
             tile := grid[ty][tx];
 
-            if tile == .WALL || tile == .BRICK || tile == .BRICK_MELTING {
+            if tile == .WALL || tile == .BRICK || tile == .BRICK_MELTING || tile == .WATER {
+                should_land = false;
+            } else if current_mechanic.tile_blocked && current_mechanic.tile_blocked(tx, ty) {
+                // Cannon, idle snowball, etc. — the bomb bounces over.
                 should_land = false;
             } else {
                 if player.x == tx && player.y == ty {
@@ -4891,6 +5416,8 @@ update :: () {
                 blocked := false;
                 if snx < 0 || snx >= COLS || sny < 0 || sny >= ROWS || grid[sny][snx] != .EMPTY {
                     blocked = true;
+                } else if current_mechanic.tile_blocked && current_mechanic.tile_blocked(snx, sny) {
+                    blocked = true;
                 } else {
                     for j: 0..bombs.count-1 {
                         if j != it_index && bombs[j].x == snx && bombs[j].y == sny {
@@ -4946,19 +5473,20 @@ update :: () {
         }
     }
 
-    for * enemies update_single_enemy(it);
+    for * en, ei: enemies update_single_enemy(en, ei);
 
-    // Hit by explosions
+    // Hit by explosions. Cart riders are invulnerable — the cart is a safe
+    // space while you're aboard.
     for explosions_list {
-        if !player.hopping && game_over_delay == 0 && it.x == player.x && it.y == player.y {
+        if !player.hopping && !player_is_riding() && game_over_delay == 0 && it.x == player.x && it.y == player.y {
             spawn_death_fx(player.rx, player.ry, col(0.353, 0.604, 0.965, 1), true);
             game_over_delay = 50;
             hit_flash_timer = 22;
             player_won = false;
             play_sfx(*sound_hit, 0.55);
         }
-        for * en: enemies {
-            if en.alive && !en.hopping && it.x == en.x && it.y == en.y {
+        for * en, ei: enemies {
+            if en.alive && !en.hopping && !enemy_is_riding(ei) && it.x == en.x && it.y == en.y {
                 en.alive = false;
                 spawn_death_fx(en.rx, en.ry, en.glow, true);
                 drop_enemy_powerups(en);
