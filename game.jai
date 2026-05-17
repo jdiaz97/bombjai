@@ -192,6 +192,35 @@ is_fullscreen: bool;
 saved_window_info: Saved_Window_Info;
 cam_mvp: Matrix4;
 
+// ─── Atmosphere & juice state ────────────────────────────────────────────────
+SHAKE_DECAY :: 0.84;
+SHAKE_MAX   :: 5.5;
+shake_amount: float;          // current shake intensity (decays each frame)
+recent_boom:  float;          // 0..1, brief surge that tints atmosphere
+
+AMBIENT_MOTE_COUNT :: 90;
+AmbientMote :: struct {
+    x, z:   float;   // world XZ (grid space, in pixels)
+    height: float;   // world Y above floor
+    vy:     float;
+    phase:  float;
+    size:   float;
+    color:  Vector4;
+}
+ambient_motes: [AMBIENT_MOTE_COUNT] AmbientMote;
+
+STAR_COUNT :: 200;
+Star :: struct {
+    sx, sy:  float;   // screen-space position (seeded once)
+    size:    float;
+    base:    float;
+    twinkle: float;
+    color:   Vector4;
+}
+stars: [STAR_COUNT] Star;
+
+atmosphere_initialized: bool;
+
 col :: (r: float, g: float, b: float, a: float) -> Vector4 {
     return .{r, g, b, a};
 }
@@ -225,6 +254,89 @@ spawn_fx :: (x: float, y: float, color: Vector4, kind: FxKind) {
 
 spawn_death_fx :: (x: float, y: float, color: Vector4, big: bool) {
     spawn_fx(x, y, color, ifx big then FxKind.BIG else FxKind.SMALL);
+}
+
+add_shake :: (amount: float) {
+    shake_amount += amount;
+    if shake_amount > SHAKE_MAX shake_amount = SHAKE_MAX;
+}
+
+init_atmosphere :: () {
+    for i: 0..AMBIENT_MOTE_COUNT-1 {
+        m := *ambient_motes[i];
+        m.x      = random_get_zero_to_one() * cast(float)(COLS * TILE);
+        m.z      = random_get_zero_to_one() * cast(float)(ROWS * TILE);
+        m.height = random_get_zero_to_one() * cast(float)TILE * 3.0;
+        m.vy     = 0.15 + random_get_zero_to_one() * 0.45;
+        m.phase  = random_get_zero_to_one() * TAU;
+        m.size   = 1.0 + random_get_zero_to_one() * 1.8;
+        roll := random_get_zero_to_one();
+        if roll < 0.55 {
+            m.color = col(0.78 + random_get_zero_to_one() * 0.18, 0.55 + random_get_zero_to_one() * 0.25, 1.0, 1);
+        } else if roll < 0.82 {
+            m.color = col(0.45 + random_get_zero_to_one() * 0.30, 0.88, 1.0, 1);
+        } else {
+            m.color = col(1.0, 0.83 + random_get_zero_to_one() * 0.15, 0.45 + random_get_zero_to_one() * 0.25, 1);
+        }
+    }
+
+    for i: 0..STAR_COUNT-1 {
+        s := *stars[i];
+        s.sx = random_get_zero_to_one() * cast(float)WINDOW_W;
+        ny := random_get_zero_to_one();
+        s.sy = ny * ny * cast(float)WINDOW_H * 0.62;
+        s.size = 0.5 + random_get_zero_to_one() * 1.6;
+        s.base = 0.35 + random_get_zero_to_one() * 0.55;
+        s.twinkle = random_get_zero_to_one() * TAU;
+        roll := random_get_zero_to_one();
+        if roll < 0.7 {
+            s.color = col(1.0, 1.0, 1.0, 1);
+        } else if roll < 0.85 {
+            s.color = col(0.70, 0.85, 1.0, 1);
+        } else if roll < 0.95 {
+            s.color = col(1.0, 0.83, 0.70, 1);
+        } else {
+            s.color = col(0.95, 0.62, 1.0, 1);
+        }
+    }
+
+    atmosphere_initialized = true;
+}
+
+update_atmosphere :: () {
+    if !atmosphere_initialized init_atmosphere();
+
+    for * ambient_motes {
+        it.height += it.vy;
+        it.phase  += 0.05;
+        // Gentle sway, breath of air pushing motes sideways
+        it.x += sin(it.phase * 0.6) * 0.18;
+        if it.height > cast(float)TILE * 4.0 {
+            it.height = 0;
+            it.x = random_get_zero_to_one() * cast(float)(COLS * TILE);
+            it.z = random_get_zero_to_one() * cast(float)(ROWS * TILE);
+            it.phase = random_get_zero_to_one() * TAU;
+        }
+    }
+
+    if recent_boom > 0 {
+        recent_boom -= 0.025;
+        if recent_boom < 0 recent_boom = 0;
+    }
+}
+
+mix4 :: (a: Vector4, b: Vector4, t: float) -> Vector4 {
+    return .{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t};
+}
+
+draw_vgradient :: (x: float, y: float, w: float, h: float, top: Vector4, bot: Vector4) {
+    Simp.immediate_quad(
+        Vector2.{x,     y    },
+        Vector2.{x + w, y    },
+        Vector2.{x + w, y + h},
+        Vector2.{x,     y + h},
+        top, top, bot, bot
+    );
 }
 
 init_grid :: () {
@@ -348,8 +460,13 @@ build_camera :: () {
     board_cx := cast(float) (COLS * TILE) * 0.5;
     board_cz := cast(float) (ROWS * TILE) * 0.5;
 
-    eye    := Vector3.{ board_cx, 1700, board_cz + 260 };
-    target := Vector3.{ board_cx, 0, board_cz };
+    t := cast(float)frame_count;
+    sx := sin(t * 1.31 + 0.7) * shake_amount * 12.0;
+    sy := cos(t * 1.77 + 1.3) * shake_amount * 8.0;
+    sz := sin(t * 2.13 + 2.4) * shake_amount * 12.0;
+
+    eye    := Vector3.{ board_cx + sx, 1700 + sy, board_cz + 260 + sz };
+    target := Vector3.{ board_cx + sx * 0.4, 0, board_cz + sz * 0.4 };
     up     := Vector3.{ 0, 1, 0 };
 
     aspect := cast(float) WINDOW_W / cast(float) WINDOW_H;
@@ -479,16 +596,19 @@ draw_wall_3d :: (c: int, r: int) {
     draw_quad_3d(.{x0, h, z0}, .{x0, h, z1}, .{x0, h - tr, z1}, .{x0, h - tr, z0}, shade(edge_dark, 1));
 
     mortar    := col(0.149, 0.137, 0.224, 1);
-    highlight := col(0.612, 0.580, 0.745, 1);
     mid_x := (x0 + x1) * 0.5;
     mid_z := (z0 + z1) * 0.5;
     mort_w :: 2.0;
     draw_quad_3d(.{x0 + 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z + mort_w}, .{x0 + 6, h + 0.1, mid_z + mort_w}, mortar);
     draw_quad_3d(.{mid_x - mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z1 - 6}, .{mid_x - mort_w, h + 0.1, z1 - 6}, mortar);
     seed := c * 53 + r * 211;
+    rune_phase := cast(float)frame_count / 22.0 + cast(float)seed * 0.013;
+    rune_pulse := 0.55 + 0.45 * sin(rune_phase);
+    rune_c := col(0.65 + 0.30 * rune_pulse, 0.42 + 0.32 * rune_pulse, 1.0, 1);
     dot_x := x0 + cast(float)(seed % 18) + 8;
     dot_z := z0 + cast(float)((seed / 5) % 18) + 8;
-    draw_quad_3d(.{dot_x, h + 0.2, dot_z}, .{dot_x + 3, h + 0.2, dot_z}, .{dot_x + 3, h + 0.2, dot_z + 3}, .{dot_x, h + 0.2, dot_z + 3}, highlight);
+    draw_quad_3d(.{dot_x - 0.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z + 3.6}, .{dot_x - 0.6, h + 0.18, dot_z + 3.6}, col(rune_c.x, rune_c.y, rune_c.z, 0.30 * rune_pulse));
+    draw_quad_3d(.{dot_x, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z + 3}, .{dot_x, h + 0.22, dot_z + 3}, rune_c);
 }
 
 draw_brick_3d :: (c: int, r: int) {
@@ -529,6 +649,252 @@ draw_brick_3d :: (c: int, r: int) {
     draw_quad_3d(.{bx, h * 0.4, z_face}, .{bx + 10, h * 0.4, z_face}, .{bx + 10, h * 0.4 + 4, z_face}, .{bx, h * 0.4 + 4, z_face}, col(0.353, 0.239, 0.102, 0.85));
 }
 
+draw_background :: () {
+    vw := cast(float)WINDOW_W;
+    vh := cast(float)WINDOW_H;
+
+    // Multi-stop vertical sky. Top = midnight indigo, mid = magenta horizon, bottom = abyss.
+    sky_top    := col(0.025, 0.012, 0.110, 1);
+    sky_high   := col(0.062, 0.024, 0.180, 1);
+    sky_mid    := col(0.205, 0.055, 0.290, 1);
+    sky_horizon := col(0.420, 0.110, 0.395, 1);
+    sky_under  := col(0.070, 0.025, 0.135, 1);
+    sky_floor  := col(0.020, 0.012, 0.058, 1);
+
+    h1 := vh * 0.18;
+    h2 := vh * 0.40;
+    h3 := vh * 0.50;
+    h4 := vh * 0.68;
+    draw_vgradient(0, 0,        vw, h1,       sky_top,    sky_high);
+    draw_vgradient(0, h1,       vw, h2 - h1,  sky_high,   sky_mid);
+    draw_vgradient(0, h2,       vw, h3 - h2,  sky_mid,    sky_horizon);
+    draw_vgradient(0, h3,       vw, h4 - h3,  sky_horizon, sky_under);
+    draw_vgradient(0, h4,       vw, vh - h4,  sky_under,  sky_floor);
+
+    // Glowing moon up-right
+    moon_pulse := 0.92 + sin(cast(float)frame_count / 90.0) * 0.08;
+    mx := vw * 0.78;
+    my := vh * 0.18;
+    for i: 0..4 {
+        rr := 36.0 + cast(float)i * 22.0;
+        a  := (0.28 - cast(float)i * 0.055) * moon_pulse;
+        if a > 0 draw_filled_circle(mx, my, rr, col(1.0, 0.78, 0.92, a), 22);
+    }
+    draw_filled_circle(mx, my, 32, col(1.0, 0.93, 0.98, moon_pulse * 0.96), 22);
+    draw_filled_circle(mx - 6, my - 8, 8, col(0.96, 0.82, 0.94, 0.55), 14);
+    draw_filled_circle(mx + 8, my + 6, 5, col(0.94, 0.75, 0.90, 0.45), 12);
+
+    // Aurora curtain — flowing wavy bands of color across the upper sky
+    aurora_t := cast(float)frame_count / 110.0;
+    for layer: 0..2 {
+        lf := cast(float)layer;
+        base_y := vh * 0.16 + lf * 18.0;
+        layer_alpha := (0.22 - lf * 0.055) * (0.85 + sin(aurora_t * 0.7 + lf) * 0.20);
+        col_a, col_b: Vector4;
+        if layer == 0 {
+            col_a = col(0.40, 0.96, 0.78, 1);
+            col_b = col(0.55, 0.42, 1.0, 1);
+        } else if layer == 1 {
+            col_a = col(0.60, 0.40, 1.0, 1);
+            col_b = col(1.0, 0.42, 0.85, 1);
+        } else {
+            col_a = col(0.32, 0.78, 1.0, 1);
+            col_b = col(0.95, 0.70, 1.0, 1);
+        }
+        steps :: 32;
+        sw := vw / cast(float)steps;
+        for i: 0..steps-1 {
+            t0 := cast(float)i / cast(float)steps;
+            t1 := cast(float)(i + 1) / cast(float)steps;
+            x0 := t0 * vw;
+            x1 := t1 * vw;
+            y0_off := sin(aurora_t + t0 * 6.0 + lf * 1.7) * 22.0;
+            y1_off := sin(aurora_t + t1 * 6.0 + lf * 1.7) * 22.0;
+            h := 56.0 + sin(aurora_t * 1.3 + t0 * 4.0 + lf) * 16.0;
+            ya := base_y + y0_off;
+            yb := base_y + y1_off;
+            ca := mix4(col_a, col_b, t0);
+            cb := mix4(col_a, col_b, t1);
+            ca.w = layer_alpha;
+            cb.w = layer_alpha;
+            ca_bottom := ca; ca_bottom.w = 0;
+            cb_bottom := cb; cb_bottom.w = 0;
+            Simp.immediate_quad(
+                Vector2.{x0, ya},
+                Vector2.{x1, yb},
+                Vector2.{x1, yb + h},
+                Vector2.{x0, ya + h},
+                ca, cb, cb_bottom, ca_bottom
+            );
+        }
+    }
+
+    // Horizon halo band (pulsing magenta)
+    horizon_y := vh * 0.50;
+    horizon_pulse := 0.85 + sin(cast(float)frame_count / 70.0) * 0.18 + recent_boom * 0.4;
+    for i: 0..5 {
+        thick := 14.0 + cast(float)i * 22.0;
+        a := (0.22 - cast(float)i * 0.038) * horizon_pulse;
+        if a > 0 Simp.immediate_quad(0, horizon_y - thick * 0.5, vw, horizon_y + thick * 0.5, col(1.0, 0.36, 0.78, a));
+    }
+    // Hot sliver right on the horizon
+    Simp.immediate_quad(0, horizon_y - 1.2, vw, horizon_y + 1.2, col(1.0, 0.78, 0.96, 0.85 * horizon_pulse));
+
+    // Stars
+    for stars {
+        // Stars near the horizon dim out
+        dimming := 1.0;
+        if it.sy > vh * 0.42 {
+            dimming = max(0.0, 1.0 - (it.sy - vh * 0.42) / (vh * 0.18));
+        }
+        a := it.base * dimming * (0.55 + 0.45 * sin(cast(float)frame_count / 22.0 + it.twinkle));
+        if a < 0.02 continue;
+        c := col(it.color.x, it.color.y, it.color.z, a);
+        draw_filled_circle(it.sx, it.sy, it.size, c, 6);
+        if it.size > 1.3 {
+            glint := a * 0.55;
+            Simp.immediate_quad(it.sx - it.size * 3.0, it.sy - 0.3, it.sx + it.size * 3.0, it.sy + 0.3, col(it.color.x, it.color.y, it.color.z, glint));
+            Simp.immediate_quad(it.sx - 0.3, it.sy - it.size * 3.0, it.sx + 0.3, it.sy + it.size * 3.0, col(it.color.x, it.color.y, it.color.z, glint));
+        }
+    }
+
+    // A couple of slow shooting streaks every now and then (deterministic on frame_count)
+    streak_period :: 320;
+    sp := frame_count % streak_period;
+    if sp < 38 {
+        t := cast(float)sp / 38.0;
+        seed := cast(float)((frame_count / streak_period) * 73 + 11);
+        sxa := (seed * 0.3 - floor(seed * 0.3)) * vw;
+        sya := (seed * 0.71 - floor(seed * 0.71)) * vh * 0.35;
+        tx := sxa + t * 280.0;
+        ty := sya + t * 70.0;
+        a := sin(t * PI) * 0.85;
+        draw_line(tx - 28, ty - 7, tx, ty, col(1.0, 1.0, 1.0, a), 1.6);
+        draw_line(tx - 14, ty - 3.5, tx + 4, ty + 1, col(0.85, 0.92, 1.0, a * 0.65), 0.9);
+        draw_filled_circle(tx, ty, 1.6, col(1, 1, 1, a), 6);
+    }
+}
+
+draw_ambient_motes_world :: () {
+    // Draw motes by projecting their world position. They get a soft glow.
+    for ambient_motes {
+        // Twinkle alpha
+        a := 0.45 + sin(it.phase) * 0.30;
+        sc, ok := project(.{it.x, it.height, it.z});
+        if !ok continue;
+        if sc.x < -20 || sc.x > cast(float)WINDOW_W + 20 continue;
+        if sc.y < -20 || sc.y > cast(float)WINDOW_H + 20 continue;
+        s := screen_scale_at(.{it.x, it.height, it.z});
+        sz := it.size * (0.8 + 0.4 * s);
+        // outer halo
+        draw_filled_circle(sc.x, sc.y, sz * 2.4, col(it.color.x, it.color.y, it.color.z, a * 0.10), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 1.4, col(it.color.x, it.color.y, it.color.z, a * 0.45), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 0.65, col(1, 1, 1, a * 0.85), 6);
+    }
+}
+
+draw_floor_light :: (cx_w: float, cz_w: float, world_radius: float, color: Vector4, intensity: float) {
+    s := screen_scale_at(.{cx_w, 0.4, cz_w});
+    sc, _ := project(.{cx_w, 0.4, cz_w});
+    rx := world_radius * s;
+    if rx < 1 return;
+    ry := rx * 0.5;
+    layers :: 6;
+    for i: 0..layers-1 {
+        t := cast(float)i / cast(float)(layers - 1);
+        f := 1.0 - t;
+        a := intensity * f * f * 0.55;
+        if a < 0.01 continue;
+        scale := 0.25 + 0.75 * f;
+        draw_filled_ellipse(sc.x, sc.y, rx * scale, ry * scale, col(color.x, color.y, color.z, a), 22);
+    }
+}
+
+draw_floor_lights :: () {
+    // Bombs: pulsing magenta pools, intensity rises near detonation.
+    for bombs {
+        if it.punching continue;
+        if it.x < 0 || it.y < 0 continue;
+        pct_left := cast(float)it.timer / cast(float)BOMB_TIMER;
+        danger := 1.0 - pct_left;
+        pulse := 0.7 + sin(cast(float)frame_count / (3.5 - danger * 1.8)) * 0.30;
+        cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+        cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+        radius := cast(float)TILE * (1.05 + danger * 0.45);
+        glow_c := col(0.702, 0.404, 1.0, 1);
+        if danger > 0.65 glow_c = col(1.0, 0.55, 0.78, 1);
+        draw_floor_light(cx_w, cz_w, radius, glow_c, (0.65 + danger * 0.45) * pulse);
+    }
+
+    // Powerups: gentle pool of their own color.
+    for powerups {
+        if it.delay > 0 continue;
+        cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+        cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+        c := powerup_color(it.type);
+        wob := 0.85 + sin(cast(float)frame_count / 18.0 + cast(float)(it.x * 7 + it.y * 11)) * 0.15;
+        draw_floor_light(cx_w, cz_w, cast(float)TILE * 0.85, c, 0.55 * wob);
+    }
+
+    // Active explosions: very bright, brief.
+    for explosions_list {
+        cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
+        cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
+        prog := 1.0 - cast(float)it.timer / cast(float)it.duration;
+        inv := 1.0 - prog;
+        radius := cast(float)TILE * (1.1 + prog * 0.6);
+        // Hot pink-white pool
+        draw_floor_light(cx_w, cz_w, radius, col(1.0, 0.85, 1.0, 1), 1.1 * inv);
+        // Outer magenta ring
+        draw_floor_light(cx_w, cz_w, radius * 1.5, col(0.95, 0.45, 1.0, 1), 0.55 * inv);
+
+        if it.origin {
+            // Expanding floor shockwave — bright thin ring crawling outward.
+            ring_r_world := cast(float)TILE * (0.2 + prog * 1.6);
+            sc, _ := project(.{cx_w, 0.5, cz_w});
+            s := screen_scale_at(.{cx_w, 0.5, cz_w});
+            rx := ring_r_world * s;
+            ry := rx * 0.5;
+            ring_a := inv * 0.85;
+            segs :: 40;
+            for j: 0..segs-1 {
+                ang := (cast(float)j / cast(float)segs) * TAU;
+                px := sc.x + cos(ang) * rx;
+                py := sc.y + sin(ang) * ry;
+                draw_filled_circle(px, py, 1.6 + inv * 1.6, col(1.0, 0.92, 1.0, ring_a), 5);
+            }
+            // Inner trailing ring
+            if prog > 0.15 {
+                inner_r := ring_r_world * 0.7;
+                irx := inner_r * s;
+                iry := irx * 0.5;
+                for j: 0..segs-1 {
+                    ang := (cast(float)j / cast(float)segs) * TAU + 0.08;
+                    px := sc.x + cos(ang) * irx;
+                    py := sc.y + sin(ang) * iry;
+                    draw_filled_circle(px, py, 1.0 + inv * 0.7, col(0.92, 0.62, 1.0, ring_a * 0.55), 5);
+                }
+            }
+        }
+    }
+
+    // Characters: subtle aura pool under each
+    if !game_over {
+        p_cx := player.rx * cast(float)TILE + cast(float)TILE * 0.5;
+        p_cz := player.ry * cast(float)TILE + cast(float)TILE * 0.5;
+        p_pulse := 0.85 + sin(cast(float)frame_count / 28.0) * 0.15;
+        draw_floor_light(p_cx, p_cz, cast(float)TILE * 0.75, col(0.40, 0.72, 1.0, 1), 0.42 * p_pulse);
+
+        for * en: enemies {
+            if !en.alive continue;
+            e_cx := en.rx * cast(float)TILE + cast(float)TILE * 0.5;
+            e_cz := en.ry * cast(float)TILE + cast(float)TILE * 0.5;
+            e_pulse := 0.85 + sin(cast(float)frame_count / 26.0 + cast(float)en.id) * 0.15;
+            draw_floor_light(e_cx, e_cz, cast(float)TILE * 0.70, en.glow, 0.40 * e_pulse);
+        }
+    }
+}
+
 draw_melting_brick_3d :: (m: MeltingBrick) {
     cx_w := cast(float)(m.x * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(m.y * TILE) + cast(float)TILE * 0.5;
@@ -548,9 +914,22 @@ draw_player_char :: (cx: float, cy: float) {
     cyb := cy + bob;
 
     glow_pulse := 0.55 + sin(cast(float)frame_count / 18.0) * 0.15;
-    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 28, 9, col(0.353, 0.604, 0.965, 0.20 * glow_pulse));
-    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 18, 6, col(0.565, 0.792, 0.976, 0.30 * glow_pulse));
-    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 2, 14, 5, col(0, 0, 0, 0.35));
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 30, 10, col(0.353, 0.604, 0.965, 0.22 * glow_pulse));
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 19, 6.5, col(0.565, 0.792, 0.976, 0.36 * glow_pulse));
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 2, 14, 5, col(0, 0, 0, 0.40));
+
+    // Orbiting magical sparkles (3 motes circling the wizard)
+    for i: 0..2 {
+        ang := cast(float)frame_count / 24.0 + cast(float)i * (TAU / 3.0);
+        ox := cos(ang) * 18.0;
+        oy := sin(ang) * 5.0 + 6;
+        depth := sin(ang) * 0.5 + 0.5;
+        a := 0.45 + depth * 0.45;
+        sz := 1.3 + depth * 1.2;
+        draw_filled_circle(cx + ox, cyb + oy, sz * 2.0, col(0.55, 0.85, 1.0, a * 0.30), 8);
+        draw_filled_circle(cx + ox, cyb + oy, sz,       col(0.78, 0.92, 1.0, a),        6);
+        draw_filled_circle(cx + ox, cyb + oy, sz * 0.5, col(1, 1, 1, a),                4);
+    }
 
     robe_dark   := col(0.043, 0.227, 0.482, 1);
     robe_mid    := col(0.084, 0.396, 0.753, 1);
@@ -675,8 +1054,25 @@ draw_enemy_char :: (e: *Enemy, cx: float, cy: float) {
             skin      = col(0.706, 0.808, 0.643, 1);
     }
 
-    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 22, 7, col(e.glow.x, e.glow.y, e.glow.z, 0.16));
-    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 2, 13, 4, col(0, 0, 0, 0.35));
+    glow_pulse := 0.6 + sin(cast(float)frame_count / 22.0 + cast(float)e.id) * 0.20;
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 26, 8.5, col(e.glow.x, e.glow.y, e.glow.z, 0.20 * glow_pulse));
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 4, 16, 5.5, col(e.glow.x, e.glow.y, e.glow.z, 0.32 * glow_pulse));
+    draw_filled_ellipse(cx, cy + cast(float)TILE/2 - 2, 13, 4, col(0, 0, 0, 0.40));
+
+    // Orbiting embers in the enemy's glow color
+    if e.stun_timer == 0 {
+        for i: 0..1 {
+            ang := cast(float)frame_count / 20.0 + cast(float)(e.id * 2 + i) * (TAU / 2.0);
+            ox := cos(ang) * 17.0;
+            oy := sin(ang) * 4.5 + 7;
+            depth := sin(ang) * 0.5 + 0.5;
+            a := 0.45 + depth * 0.45;
+            sz := 1.2 + depth * 1.0;
+            draw_filled_circle(cx + ox, cyb + oy, sz * 2.2, col(e.glow.x, e.glow.y, e.glow.z, a * 0.30), 8);
+            draw_filled_circle(cx + ox, cyb + oy, sz,       col(e.glow.x, e.glow.y, e.glow.z, a),        6);
+            draw_filled_circle(cx + ox, cyb + oy, sz * 0.5, col(1, 1, 1, a * 0.85),                       4);
+        }
+    }
 
     // Robe is the body — stays fixed (doesn't pivot with head)
     draw_triangle(cx - 16, cyb + 22, cx - 8, cyb + 2, cx + 8, cyb + 2, robe_dark);
@@ -819,41 +1215,154 @@ draw_enemy_char :: (e: *Enemy, cx: float, cy: float) {
 
 draw_bomb :: (b: Bomb, bx: float, by: float) {
     pct_left := cast(float)b.timer / cast(float)BOMB_TIMER;
-    pulse := sin(cast(float)frame_count / 4.0) * (3 + (1 - pct_left) * 4);
+    danger := 1.0 - pct_left;
+    pulse_rate := 4.0 - danger * 2.5;
+    if pulse_rate < 1.2 pulse_rate = 1.2;
+    pulse := sin(cast(float)frame_count / pulse_rate) * (2.5 + danger * 5.0);
     r := 11 + pulse;
 
-    draw_filled_ellipse(bx, by + r + 2, r, 3, col(0, 0, 0, 0.2));
-    draw_filled_circle(bx, by, r, col(0.486, 0.302, 1.0, 1), 16);
-    draw_filled_circle(bx - r * 0.3, by - r * 0.3, r * 0.3, col(0.702, 0.533, 1.0, 0.4), 8);
+    // Drop shadow under the bomb (tilted ellipse for perspective)
+    draw_filled_ellipse(bx, by + r + 1, r * 1.05, 3.5, col(0, 0, 0, 0.50));
 
-    if sin(cast(float)frame_count / 3.0) > 0 {
-        draw_filled_circle(bx, by - r - 4 + sin(cast(float)frame_count / 5.0) * 3, 3, col(0.882, 0.745, 0.906, 1), 6);
-        draw_filled_circle(bx, by - r - 5 + sin(cast(float)frame_count / 5.0) * 3, 1.5, col(1, 1, 1, 1), 4);
+    // Pulsing aura — magenta near boom, lavender otherwise
+    aura_col := mix4(col(0.722, 0.498, 1.0, 1), col(1.0, 0.55, 0.78, 1), danger);
+    aura_pulse := 0.7 + sin(cast(float)frame_count / 6.0) * 0.30;
+    for i: 0..3 {
+        rr := r + 5.0 + cast(float)i * 5.5;
+        a := (0.32 - cast(float)i * 0.075) * aura_pulse;
+        if a > 0 draw_filled_circle(bx, by, rr, col(aura_col.x, aura_col.y, aura_col.z, a), 16);
+    }
+
+    // Body — darker rim, mid, highlight
+    body_dark := col(0.235, 0.063, 0.392, 1);
+    body_mid  := col(0.486, 0.302, 1.0, 1);
+    body_hi   := col(0.737, 0.604, 1.0, 1);
+    draw_filled_circle(bx, by, r,           body_dark, 18);
+    draw_filled_circle(bx, by, r - 1.6,     body_mid,  18);
+    draw_filled_circle(bx - r * 0.30, by - r * 0.32, r * 0.36, body_hi, 12);
+    draw_filled_circle(bx - r * 0.40, by - r * 0.42, r * 0.18, col(1, 1, 1, 0.65), 8);
+
+    // Equator highlight (subtle scanline)
+    Simp.immediate_quad(bx - r * 0.85, by - 0.7, bx + r * 0.85, by + 0.7, col(0.88, 0.78, 1.0, 0.18));
+
+    // Plasma arc skating across the bomb near detonation
+    if danger > 0.55 {
+        arc_phase := cast(float)frame_count / 2.0;
+        if sin(arc_phase + cast(float)(b.x * 7 + b.y * 11)) > 0.0 {
+            ax := bx + cos(arc_phase * 0.7) * r * 0.45;
+            ay := by + sin(arc_phase * 0.9) * r * 0.45;
+            bx2 := bx + cos(arc_phase * 0.7 + 2.0) * r * 0.45;
+            by2 := by + sin(arc_phase * 0.9 + 2.4) * r * 0.45;
+            draw_line(ax, ay, bx2, by2, col(1, 0.92, 1.0, 0.85), 1.4);
+        }
+    }
+
+    // Fuse — wire + spark
+    fuse_wob := sin(cast(float)frame_count / 5.0) * 3;
+    fuse_top_y := by - r - 8 + fuse_wob;
+    fuse_mid_x := bx + sin(cast(float)frame_count / 7.0) * 2.5;
+    fuse_mid_y := by - r - 2 + fuse_wob * 0.5;
+    draw_line(bx, by - r + 0.5, fuse_mid_x, fuse_mid_y, col(0.34, 0.18, 0.45, 1), 2.2);
+    draw_line(fuse_mid_x, fuse_mid_y, fuse_mid_x + 1.5, fuse_top_y, col(0.34, 0.18, 0.45, 1), 2.2);
+
+    spark_x := fuse_mid_x + 1.5;
+    spark_y := fuse_top_y;
+    spark_size := 3.0 + sin(cast(float)frame_count / 2.0) * 0.9 + danger * 1.4;
+    spark_c    := mix4(col(1.0, 0.86, 0.32, 1), col(1.0, 0.42, 0.32, 1), danger);
+    // outer glow
+    draw_filled_circle(spark_x, spark_y, spark_size * 2.2, col(spark_c.x, spark_c.y, spark_c.z, 0.30), 10);
+    draw_filled_circle(spark_x, spark_y, spark_size * 1.4, col(spark_c.x, spark_c.y, spark_c.z, 0.65), 8);
+    draw_filled_circle(spark_x, spark_y, spark_size,        spark_c, 8);
+    draw_filled_circle(spark_x, spark_y, spark_size * 0.5,  col(1, 1, 1, 1), 6);
+
+    // Tiny dancing sparks
+    for i: 0..3 {
+        t := cast(float)(frame_count + i * 9 + cast(int)(bx * 0.3)) / 5.0;
+        ox := cos(t + cast(float)i) * (4.5 + cast(float)i);
+        oy := sin(t * 1.3 + cast(float)i) * 3.0 - 2.0;
+        a  := 0.7 - cast(float)i * 0.15;
+        if a > 0 {
+            draw_filled_circle(spark_x + ox, spark_y + oy, 0.9 + danger * 0.4, col(1, 0.88, 0.50, a), 4);
+        }
     }
 }
 
 draw_explosion :: (e: Explosion, ex: float, ey: float) {
     progress := 1 - cast(float)e.timer / cast(float)e.duration;
-    alpha := min(1.0, cast(float)e.timer / cast(float)e.duration + 0.2);
-    size := cast(float)TILE - 4 + sin(progress * PI) * 8;
+    inv      := 1.0 - progress;
+    alpha    := min(1.0, cast(float)e.timer / cast(float)e.duration + 0.2);
+    size     := cast(float)TILE - 4 + sin(progress * PI) * 10;
+
+    // Wide halo (bloom-ish)
+    halo_a := inv * 0.55;
+    draw_filled_circle(ex, ey, size * 0.95, col(1.0, 0.65, 0.96, halo_a * 0.35), 22);
+    draw_filled_circle(ex, ey, size * 0.72, col(0.95, 0.75, 1.0, halo_a * 0.55), 22);
 
     if e.origin {
+        // Bright central flash for the first ~third of life
+        flash := max(0.0, (0.45 - progress) / 0.45);
+        if flash > 0 {
+            draw_filled_circle(ex, ey, size * 0.62, col(1, 0.96, 1.0, flash * 0.95), 18);
+            draw_filled_circle(ex, ey, size * 0.40, col(1, 1, 1,   flash), 18);
+        }
+
+        // Outward spokes — sharp, bright, with white core
         for i: 0..7 {
             ray_angle := (cast(float)i / 8.0) * TAU + progress * 0.6;
-            ray_len := size * 0.55 + sin(progress * PI) * 6;
+            ray_len := size * 0.85 + sin(progress * PI) * 14;
             rx := ex + cos(ray_angle) * ray_len;
-            ry := ey + sin(ray_angle) * ray_len;
-            draw_line(ex, ey, rx, ry, col(1.0, 0.929, 0.804, alpha * 0.5), 2);
+            ry := ey + sin(ray_angle) * ray_len * 0.78;
+            draw_line(ex, ey, rx, ry, col(1.0, 0.92, 0.88, alpha * 0.8 * inv), 3.2);
+            draw_line(ex, ey, rx, ry, col(1, 1, 1, alpha * inv * 0.6), 1.1);
         }
-        draw_filled_circle(ex, ey, size / 2, col(0.882, 0.745, 0.906, alpha), 16);
-        draw_filled_circle(ex, ey, size / 2 - 3, col(0.702, 0.533, 1.0, alpha), 16);
-        draw_filled_circle(ex, ey, size / 2 - 8, col(0.820, 0.769, 0.914, alpha), 16);
-        draw_filled_circle(ex, ey, size / 3, col(1, 1, 1, alpha), 16);
+
+        // Smaller secondary spokes at 45° offset
+        for i: 0..7 {
+            ray_angle := (cast(float)i / 8.0) * TAU + 0.39 - progress * 0.4;
+            ray_len := size * 0.55 + sin(progress * PI) * 8;
+            rx := ex + cos(ray_angle) * ray_len;
+            ry := ey + sin(ray_angle) * ray_len * 0.78;
+            draw_line(ex, ey, rx, ry, col(1.0, 0.72, 0.92, alpha * 0.45 * inv), 1.6);
+        }
+
+        // Core layers
+        draw_filled_circle(ex, ey, size * 0.50, col(0.940, 0.785, 1.0,   alpha), 20);
+        draw_filled_circle(ex, ey, size * 0.36, col(0.702, 0.533, 1.0,   alpha), 18);
+        draw_filled_circle(ex, ey, size * 0.22, col(1.0, 0.96, 1.0,      alpha), 14);
+        draw_filled_circle(ex, ey, size * 0.10, col(1, 1, 1, alpha), 8);
+
+        // Hot embers ejecting outward
+        ember_n :: 8;
+        for k: 0..ember_n-1 {
+            seed := cast(float)(k * 41 + e.x * 17 + e.y * 53);
+            ang := seed + progress * 1.4;
+            spd := 38.0 + (seed * 0.13 - floor(seed * 0.13)) * 30.0;
+            dist := spd * progress;
+            px := ex + cos(ang) * dist;
+            py := ey + sin(ang) * dist * 0.7 - progress * 8.0;
+            sz := (2.4 + (seed * 0.7 - floor(seed * 0.7)) * 1.6) * inv;
+            if sz > 0.3 {
+                draw_filled_circle(px, py, sz * 1.5, col(1.0, 0.72, 0.58, inv * 0.50), 5);
+                draw_filled_circle(px, py, sz,       col(1.0, 0.92, 0.82, inv * 0.85), 5);
+                draw_filled_circle(px, py, sz * 0.5, col(1, 1, 1, inv * 0.75), 4);
+            }
+        }
     } else {
-        draw_filled_circle(ex, ey, size / 2, col(0.486, 0.302, 1.0, alpha), 16);
-        draw_filled_circle(ex, ey, size / 2 - 4, col(0.702, 0.533, 1.0, alpha), 16);
-        draw_filled_circle(ex, ey, size / 2 - 10, col(0.882, 0.745, 0.906, alpha), 16);
-        draw_filled_circle(ex, ey, size / 4 - 2, col(1, 1, 1, alpha), 8);
+        // Branch arms — swirly flames
+        seg :: 14;
+        for i: 0..seg-1 {
+            t := cast(float)i / cast(float)seg;
+            ang := t * TAU + progress * 1.4;
+            r := size * 0.50 * (0.6 + sin(t * PI + progress * 3.0) * 0.30);
+            fx_x := ex + cos(ang) * r;
+            fx_y := ey + sin(ang) * r * 0.8;
+            draw_filled_circle(fx_x, fx_y, 2.6 + inv * 1.6, col(1.0, 0.68, 0.96, alpha * inv * 0.85), 6);
+        }
+        // Core
+        draw_filled_circle(ex, ey, size * 0.55, col(0.486, 0.302, 1.0, alpha),       18);
+        draw_filled_circle(ex, ey, size * 0.40, col(0.736, 0.564, 1.0, alpha),       16);
+        draw_filled_circle(ex, ey, size * 0.26, col(0.946, 0.790, 1.0, alpha),       14);
+        draw_filled_circle(ex, ey, size * 0.12, col(1, 1, 1, alpha), 10);
     }
 }
 
@@ -1045,6 +1554,9 @@ explode :: (b: Bomb) {
     e.duration = EXPLOSION_DURATION;
     e.origin = true;
     array_add(*explosions_list, e);
+
+    add_shake(ifx b.chain then 1.65 else 1.05);
+    recent_boom = 1.0;
 
     for dir_idx: 0..3 {
         dx := DIRS[dir_idx * 2];
@@ -1576,8 +2088,12 @@ punch_bomb :: () {
 }
 
 update :: () {
-    if game_over return;
     frame_count += 1;
+    update_atmosphere();
+    shake_amount *= SHAKE_DECAY;
+    if shake_amount < 0.01 shake_amount = 0;
+
+    if game_over return;
 
     player.rx += (cast(float)player.x - player.rx) * LERP_SPEED;
     player.ry += (cast(float)player.y - player.ry) * LERP_SPEED;
@@ -1811,6 +2327,9 @@ update :: () {
             p := *powerups[i];
             if p.delay > 0 {
                 p.delay -= 1;
+                if p.delay == 0 {
+                    spawn_fx(cast(float)p.x, cast(float)p.y, powerup_color(p.type), .SMALL);
+                }
                 i -= 1;
                 continue;
             }
@@ -1865,38 +2384,84 @@ draw_text :: (text: string, x: int, y: int, color: Vector4) {
     Simp.draw_prepared_text(my_font, x, y, color);
 }
 
-draw_hud :: () {
-    bx := 8.0; by := 8.0; bw := 320.0; bh := 40.0;
-    draw_rounded_rect(bx, by, bw, bh, 8, col(0.078, 0.063, 0.141, 0.85));
+draw_hud_panel :: () {
+    bx := 8.0; by := 8.0; bw := 340.0; bh := 44.0;
+    // Subtle drop shadow
+    draw_rounded_rect(bx + 2, by + 3, bw, bh, 9, col(0, 0, 0, 0.35));
+    // Body
+    draw_rounded_rect(bx, by, bw, bh, 9, col(0.058, 0.040, 0.118, 0.88));
+    // Inner highlight gradient (thin top strip)
+    draw_rounded_rect(bx + 2, by + 1, bw - 4, 6, 7, col(0.18, 0.14, 0.36, 0.42));
+    // Outline
+    draw_stroke_rect(bx, by, bw, bh, col(0.78, 0.62, 1.0, 0.30), 1.4);
 
-    ty := by + bh / 2 - 7;
+    pulse := 0.85 + sin(cast(float)frame_count / 14.0) * 0.15;
 
-    draw_filled_circle(bx + 18, by + bh / 2, 6, col(0.702, 0.533, 1.0, 1), 8);
-    draw_filled_circle(bx + 18, by + bh / 2, 4, col(0.486, 0.302, 1.0, 1), 8);
-    draw_text(tprint("%", player.max_bombs), cast(int)(bx + 28), cast(int) ty, col(0.882, 0.745, 0.906, 1));
+    // Bomb count chip
+    cx := bx + 22; cy := by + bh / 2;
+    for i: 0..2 {
+        rr := 6.0 + cast(float)i * 4.0;
+        a := (0.25 - cast(float)i * 0.07) * pulse;
+        if a > 0 draw_filled_circle(cx, cy, rr, col(0.702, 0.533, 1.0, a), 14);
+    }
+    draw_filled_circle(cx, cy, 7, col(0.486, 0.302, 1.0, 1), 12);
+    draw_filled_circle(cx - 2, cy - 2, 2.5, col(1, 1, 1, 0.85), 6);
 
-    draw_filled_circle(bx + 55, by + bh / 2, 6, col(1.0, 0.671, 0.251, 1), 8);
-    draw_text(tprint("%", player.fire_range), cast(int)(bx + 68), cast(int) ty, col(1.0, 0.878, 0.706, 1));
+    // Fire chip
+    fx := bx + 64;
+    for i: 0..2 {
+        rr := 6.0 + cast(float)i * 4.0;
+        a := (0.25 - cast(float)i * 0.07) * pulse;
+        if a > 0 draw_filled_circle(fx, cy, rr, col(1.0, 0.55, 0.20, a), 14);
+    }
+    draw_filled_circle(fx, cy, 6, col(1.0, 0.671, 0.251, 1), 12);
+    draw_filled_circle(fx - 1, cy - 1.5, 2, col(1, 1, 0.85, 0.85), 6);
 
-    // Skate icon (boot+wheels miniature)
-    sx_hud := bx + 95;
+    // Skate icon
+    sx_hud := bx + 105;
     sy_hud := by + bh / 2;
-    draw_filled_rect(sx_hud - 5, sy_hud - 2, 10, 4, col(0.298, 0.329, 0.451, 1));
-    draw_filled_rect(sx_hud + 0, sy_hud - 6, 5, 4, col(0.298, 0.329, 0.451, 1));
-    draw_filled_circle(sx_hud - 3, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
-    draw_filled_circle(sx_hud + 1, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
-    draw_filled_circle(sx_hud + 5, sy_hud + 3, 1.6, col(0.137, 0.165, 0.255, 1), 6);
-    draw_text(tprint("%", player.skate_count), cast(int)(bx + 108), cast(int) ty, col(0.612, 0.851, 1.0, 1));
+    draw_filled_circle(sx_hud, sy_hud, 11, col(0.42, 0.81, 1.0, 0.22 * pulse), 12);
+    draw_filled_rect(sx_hud - 6, sy_hud - 2, 12, 4, col(0.298, 0.329, 0.451, 1));
+    draw_filled_rect(sx_hud + 0, sy_hud - 6, 6, 4, col(0.298, 0.329, 0.451, 1));
+    draw_filled_circle(sx_hud - 4, sy_hud + 3, 1.7, col(0.10, 0.13, 0.22, 1), 6);
+    draw_filled_circle(sx_hud + 1, sy_hud + 3, 1.7, col(0.10, 0.13, 0.22, 1), 6);
+    draw_filled_circle(sx_hud + 5, sy_hud + 3, 1.7, col(0.10, 0.13, 0.22, 1), 6);
 
     if player.has_kick {
-        draw_filled_circle(bx + 145, by + bh / 2, 6, col(0, 0.737, 0.827, 1), 8);
-        draw_text("KICK", cast(int)(bx + 155), cast(int) ty, col(0.698, 0.922, 0.949, 1));
+        kx := bx + 158;
+        for i: 0..1 {
+            rr := 7.0 + cast(float)i * 4.0;
+            a := (0.30 - cast(float)i * 0.10) * pulse;
+            if a > 0 draw_filled_circle(kx, cy, rr, col(0, 0.85, 0.95, a), 12);
+        }
+        draw_filled_circle(kx, cy, 6, col(0, 0.737, 0.827, 1), 10);
+        draw_filled_circle(kx - 1.5, cy - 1.5, 1.6, col(1, 1, 1, 0.85), 5);
     }
 
     if player.has_punch {
-        px_hud := ifx player.has_kick then bx + 210 else bx + 145;
-        draw_filled_circle(px_hud, by + bh / 2, 6, col(1.0, 0.757, 0.027, 1), 8);
-        draw_text("PNCH", cast(int)(px_hud + 10), cast(int) ty, col(1.0, 0.976, 0.769, 1));
+        px_hud := ifx player.has_kick then bx + 225 else bx + 158;
+        for i: 0..1 {
+            rr := 7.0 + cast(float)i * 4.0;
+            a := (0.30 - cast(float)i * 0.10) * pulse;
+            if a > 0 draw_filled_circle(px_hud, cy, rr, col(1.0, 0.85, 0.25, a), 12);
+        }
+        draw_filled_circle(px_hud, cy, 6, col(1.0, 0.757, 0.027, 1), 10);
+        draw_filled_circle(px_hud - 1.5, cy - 1.5, 1.6, col(1, 1, 1, 0.85), 5);
+    }
+}
+
+draw_hud :: () {
+    bx := 8.0; by := 8.0; bh := 44.0;
+    ty := by + bh / 2 - 7;
+    draw_text(tprint("%", player.max_bombs), cast(int)(bx + 32), cast(int) ty, col(0.940, 0.835, 1.0, 1));
+    draw_text(tprint("%", player.fire_range), cast(int)(bx + 75), cast(int) ty, col(1.0, 0.93, 0.78, 1));
+    draw_text(tprint("%", player.skate_count), cast(int)(bx + 120), cast(int) ty, col(0.74, 0.92, 1.0, 1));
+    if player.has_kick {
+        draw_text("KICK", cast(int)(bx + 170), cast(int) ty, col(0.78, 0.96, 0.98, 1));
+    }
+    if player.has_punch {
+        px_hud := ifx player.has_kick then bx + 235 else bx + 170;
+        draw_text("PNCH", cast(int)(px_hud + 8), cast(int) ty, col(1.0, 0.96, 0.80, 1));
     }
 }
 
@@ -1924,10 +2489,26 @@ render :: () {
     Simp.set_shader_for_color(enable_blend=true);
     Simp.immediate_set_2d_projection(WINDOW_W, WINDOW_H);
 
+    if !atmosphere_initialized init_atmosphere();
+
     build_camera();
 
-    draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H * 0.55, col(0.094, 0.078, 0.180, 1));
-    draw_filled_rect(0, cast(float)WINDOW_H * 0.55, cast(float)WINDOW_W, cast(float)WINDOW_H * 0.45, col(0.063, 0.055, 0.137, 1));
+    // Dramatic backdrop: sky gradient, moon, horizon halo, stars
+    draw_background();
+
+    // Background ambient motes — far ones drift behind the play area
+    for ambient_motes {
+        // Only draw "back" motes here (those whose world Z is in the back half of the board)
+        if it.z > cast(float)(ROWS * TILE) * 0.5 continue;
+        a := 0.45 + sin(it.phase) * 0.30;
+        sc, ok := project(.{it.x, it.height, it.z});
+        if !ok continue;
+        s := screen_scale_at(.{it.x, it.height, it.z});
+        sz := it.size * (0.7 + 0.4 * s);
+        draw_filled_circle(sc.x, sc.y, sz * 2.4, col(it.color.x, it.color.y, it.color.z, a * 0.08), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 1.3, col(it.color.x, it.color.y, it.color.z, a * 0.40), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 0.55, col(1, 1, 1, a * 0.85), 6);
+    }
 
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
@@ -1936,6 +2517,9 @@ render :: () {
             }
         }
     }
+
+    // Floor light pools (bombs, powerups, explosions, characters) — drawn over floor, under walls
+    draw_floor_lights();
 
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
@@ -2032,26 +2616,73 @@ render :: () {
         }
     }
 
+    // Foreground motes — front half of the board (drift past the camera)
+    for ambient_motes {
+        if it.z <= cast(float)(ROWS * TILE) * 0.5 continue;
+        a := 0.45 + sin(it.phase) * 0.30;
+        sc, ok := project(.{it.x, it.height, it.z});
+        if !ok continue;
+        s := screen_scale_at(.{it.x, it.height, it.z});
+        sz := it.size * (0.85 + 0.55 * s);
+        draw_filled_circle(sc.x, sc.y, sz * 2.6, col(it.color.x, it.color.y, it.color.z, a * 0.10), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 1.45, col(it.color.x, it.color.y, it.color.z, a * 0.50), 8);
+        draw_filled_circle(sc.x, sc.y, sz * 0.6, col(1, 1, 1, a * 0.9), 6);
+    }
+
     vw := cast(float)WINDOW_W;
     vh := cast(float)WINDOW_H;
-    vig := col(0, 0, 0, 0.32);
-    band :: 90.0;
-    draw_filled_rect(0, 0,            vw,   band,       vig);
-    draw_filled_rect(0, vh - band,    vw,   band,       vig);
-    draw_filled_rect(0, 0,            band, vh,         vig);
-    draw_filled_rect(vw - band, 0,    band, vh,         vig);
-    vig2 := col(0, 0, 0, 0.22);
-    draw_filled_rect(0, 0,            vw,   band * 0.5, vig2);
-    draw_filled_rect(0, vh - band*0.5, vw,  band * 0.5, vig2);
+
+    // Radial-ish vignette: edge bands (heavier) + corner darkening + soft outer glow on top edges
+    vig_edge := col(0.0, 0.0, 0.020, 0.40);
+    band :: 110.0;
+    draw_filled_rect(0, 0,            vw,   band,       vig_edge);
+    draw_filled_rect(0, vh - band,    vw,   band,       vig_edge);
+    draw_filled_rect(0, 0,            band, vh,         vig_edge);
+    draw_filled_rect(vw - band, 0,    band, vh,         vig_edge);
+    // Soft inner second band
+    vig2 := col(0.0, 0.0, 0.020, 0.22);
+    draw_filled_rect(0, 0,            vw,   band * 0.55, vig2);
+    draw_filled_rect(0, vh - band*0.55, vw,  band * 0.55, vig2);
+    draw_filled_rect(0, 0,            band * 0.55, vh,   vig2);
+    draw_filled_rect(vw - band*0.55, 0, band * 0.55, vh, vig2);
+    // Heavier corners (overlapping)
+    vig_corn := col(0.0, 0.0, 0.020, 0.32);
+    cs :: 220.0;
+    draw_filled_rect(0,           0,           cs, cs, vig_corn);
+    draw_filled_rect(vw - cs,     0,           cs, cs, vig_corn);
+    draw_filled_rect(0,           vh - cs,     cs, cs, vig_corn);
+    draw_filled_rect(vw - cs,     vh - cs,     cs, cs, vig_corn);
+
+    // Top warm-tint atmosphere overlay tied to recent explosions
+    if recent_boom > 0 {
+        a := recent_boom * 0.18;
+        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.55, 0.85, a));
+    }
 
     if hit_flash_timer > 0 {
         a := cast(float)hit_flash_timer / 22.0;
-        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.180, 0.180, a * 0.35));
+        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.140, 0.180, a * 0.32));
+        rim_a := a * 0.55;
+        draw_filled_rect(0, 0, vw, 22, col(1.0, 0.18, 0.20, rim_a));
+        draw_filled_rect(0, vh - 22, vw, 22, col(1.0, 0.18, 0.20, rim_a));
+        draw_filled_rect(0, 0, 22, vh, col(1.0, 0.18, 0.20, rim_a));
+        draw_filled_rect(vw - 22, 0, 22, vh, col(1.0, 0.18, 0.20, rim_a));
     }
     if victory_flash_timer > 0 {
         a := cast(float)victory_flash_timer / 30.0;
-        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.937, 0.541, a * 0.28));
+        draw_filled_rect(0, 0, vw, vh, col(1.0, 0.937, 0.541, a * 0.30));
+        // sunburst rays from center
+        cx := vw * 0.5;
+        cy := vh * 0.5;
+        for i: 0..11 {
+            ang := (cast(float)i / 12.0) * TAU + cast(float)(victory_flash_timer) * 0.04;
+            ex := cx + cos(ang) * vw;
+            ey := cy + sin(ang) * vh;
+            draw_line(cx, cy, ex, ey, col(1.0, 0.92, 0.60, a * 0.35), 3.0);
+        }
     }
+
+    draw_hud_panel();
 
     Simp.immediate_flush();
     Simp.set_shader_for_text();
@@ -2062,27 +2693,64 @@ render :: () {
     if game_over {
         Simp.set_shader_for_color(enable_blend=true);
         Simp.immediate_set_2d_projection(WINDOW_W, WINDOW_H);
-        draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H, col(0.039, 0.031, 0.094, 0.8));
+
+        // Dim background
+        draw_filled_rect(0, 0, cast(float)WINDOW_W, cast(float)WINDOW_H, col(0.020, 0.014, 0.050, 0.78));
+
+        cx_w := cast(float)WINDOW_W / 2;
+        cy_w := cast(float)WINDOW_H / 2;
+
+        // Beams / rays from the center
+        ray_count := 18;
+        for i: 0..ray_count-1 {
+            ang := (cast(float)i / cast(float)ray_count) * TAU + cast(float)frame_count * 0.008;
+            len := 1.4 * cast(float)WINDOW_W;
+            ex := cx_w + cos(ang) * len;
+            ey := cy_w + sin(ang) * len;
+            ray_color := ifx player_won then col(1.0, 0.85, 0.45, 0.10) else col(0.95, 0.25, 0.30, 0.10);
+            draw_line(cx_w, cy_w, ex, ey, ray_color, 14.0);
+        }
+
+        // Central halo
+        halo_color := ifx player_won then col(0.95, 0.78, 0.45, 1) else col(0.95, 0.30, 0.32, 1);
+        for i: 0..6 {
+            rr := 80.0 + cast(float)i * 32.0;
+            a := (0.40 - cast(float)i * 0.055);
+            if a > 0 draw_filled_circle(cx_w, cy_w, rr, col(halo_color.x, halo_color.y, halo_color.z, a), 22);
+        }
+
+        // Decorative ring
+        if player_won {
+            ring_pulse := 1.0 + sin(cast(float)frame_count / 20.0) * 0.05;
+            ring_r := 95.0 * ring_pulse;
+            segs := 36;
+            for i: 0..segs-1 {
+                ang := (cast(float)i / cast(float)segs) * TAU;
+                rx := cx_w + cos(ang) * ring_r;
+                ry := cy_w + sin(ang) * ring_r;
+                draw_filled_circle(rx, ry, 2.4, col(1.0, 0.95, 0.65, 0.85), 6);
+            }
+        }
+
         Simp.immediate_flush();
         Simp.set_shader_for_text();
         Simp.immediate_set_2d_projection(WINDOW_W, WINDOW_H);
 
-        cy := cast(float)WINDOW_H / 2;
         text_color: Vector4;
         if player_won {
-            text_color = col(0.486, 0.302, 1.0, 1);
+            text_color = col(1.0, 0.92, 0.65, 1);
         } else {
-            text_color = col(0.957, 0.263, 0.212, 1);
+            text_color = col(1.0, 0.42, 0.42, 1);
         }
 
         msg := ifx player_won then "VICTORY" else "DEFEATED";
         if my_font {
             tw := Simp.prepare_text(my_font, msg);
-            Simp.draw_prepared_text(my_font, (WINDOW_W - tw) / 2, cast(s64)(cy - 20), text_color);
+            Simp.draw_prepared_text(my_font, (WINDOW_W - tw) / 2, cast(s64)(cy_w - 20), text_color);
 
             restart_text := "Press R to restart";
             tw2 := Simp.prepare_text(my_font, restart_text);
-            Simp.draw_prepared_text(my_font, (WINDOW_W - tw2) / 2, cast(s64)(cy + 30), col(1, 1, 1, 0.7));
+            Simp.draw_prepared_text(my_font, (WINDOW_W - tw2) / 2, cast(s64)(cy_w + 40), col(0.92, 0.92, 1, 0.85));
         }
         Simp.immediate_flush();
     }
@@ -2146,6 +2814,9 @@ reset_state :: () {
     player_won = false;
     move_timer = 0;
     frame_count = 0;
+    shake_amount = 0;
+    recent_boom  = 0;
+    if !atmosphere_initialized init_atmosphere();
     key_up = false; key_down = false; key_left = false; key_right = false;
 }
 
