@@ -1,5 +1,21 @@
 # Development Log
 
+## Directional mana stream explosions
+
+Arm tiles of the blast now read as a flow of mana, not a row of fireballs. `Explosion` gained `dx, dy, is_tip` — populated in `explode()` and `tick_pirate` (cannon path); the outermost tile of each arm flips `is_tip=true`. `draw_explosion` keeps the origin's radial burst, but non-origin tiles route through new `draw_arm_flow`: the tile's inner and outer edge midpoints are projected through the camera, a capsule of layered colour-ringed circles is marched between them in screen space, and the outer end tapers via a sqrt half-circle profile only when `is_tip` (other tiles continue straight into their neighbour). Sliding bubble sparkles travel outward to sell the flow direction, with a brighter rounded bead on the tip.
+
+## Mana-bomb visual pass
+
+Bombs read as mana orbs now, not powder. `draw_bomb` lost the fuse-and-spark and gained a hovering runic crystal with a wisp tail, an inner mana swirl, jaggier plasma arcs that scale with the danger curve, orbiting glints, and rising mana motes. Bomb world-Y at the call site lifted from `TILE * 0.3` to `TILE * 0.42` plus a per-tile-seeded sin bob so the orb floats. `draw_floor_lights` got a new `draw_bomb_sigil` pass — a slow-rotating hexagram of dotted leglines with eight rune dots around the rim and a pulsing core — painted on the floor before the existing magenta light pool.
+
+## Readability via the type system
+
+Same-looks-same rule baked into Theme. Two renderer aliases: `BlockRenderer :: #type (cx_w: float, cz_w: float)` for things that must look identical at every tile (interior pillars + destructible bricks — no tile indices, no way to seed by position), and `DecorRenderer :: #type (c: int, r: int)` for the explicitly-variable arena ring. Theme now exposes `pillar_renderer`, `brick_renderer`, `border_renderer`. Each themed `draw_wall_X(c, r)` was split into `draw_pillar_X(cx_w, cz_w)` (body) and `draw_border_X(c, r)` (ornaments); each `draw_brick_X` re-signatured to `(cx_w, cz_w)`. `draw_wall_3d` / `draw_brick_3d` are now thin dispatchers. Floor uniformity: checkerboard + random per-tile twinkle speck removed — every walkable tile is identical. All brick renderers had their per-tile random seeds (grain offsets, label offsets, ore-fleck positions, sparkle positions, knot offsets, crate/barrel coin-flip) replaced with deterministic positions on a shared pulse, so every destructible reads the same from across the screen.
+
+## Depth-sorted 3D layer (Option A)
+
+Replaced the per-row painter's algorithm for the 3D world with a depth-sorted draw list. `draw_quad_3d` / `draw_tri_3d` now project + append a `Draw3DCmd` (screen-space verts + camera-space depth via `project_depth`) to `draw3d_list` instead of submitting immediately to Simp. `flush_draw3d()` quick-sorts back-to-front and submits in one pass. The render pipeline is now: queue floor → flush → 2D floor lights → queue ground hooks + walls + bricks + melts → flush → per-row 2D billboards (chars, bombs, powerups, mechanic.draw_row, explosions, death FX). Walls/bricks composite correctly regardless of which (col, row) they sit at, which unlocks lower camera pitches and removes per-row sorting artifacts. No GL changes; one new `#import "Sort"`.
+
 ## Pirate deck pass + audit fixes
 
 Pirate level got the ship-deck feel it was missing: `draw_pirate_deck` (wired to `draw_ground`) paints horizontal plank seams + brass deck nails across the entire arena, and `draw_pirate_overlay` (wired to `draw_overlay`) drifts sea-spray strands across the lower frame with seagulls circling above. `draw_brick_pirate` now picks between crate and wooden barrel by tile seed (50/50), so the destructibles read as mixed cargo instead of a crate maze. Bug audit fixes: punched bombs now consult `tile_blocked` + `.WATER` so they bounce off cannons/snowballs/water instead of dying on top of a cannon (which silently disabled it); kicked-bomb slide + initial-kick checks gained the same gate; `update_single_enemy` skips the cart rider so they can't drop bombs from the cart or BFS off it; `place_bomb` and `enemy_try_place_bomb` got defense-in-depth `tile_blocked` checks.

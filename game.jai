@@ -1,6 +1,7 @@
 #import "Basic";
 #import "Math";
 #import "Random";
+#import "Sort";
 #import "Window_Creation";
 Input :: #import "Input";
 #import "String";
@@ -148,11 +149,21 @@ Theme :: struct {
     mote_b: Vector4;
     mote_c: Vector4;
 
-    // Optional per-level renderers. Null → use the default stone wall +
-    // mortar brick. Themes that set these get a fully custom block silhouette.
-    wall_renderer:  #type (c: int, r: int);
-    brick_renderer: #type (c: int, r: int);
+    // Optional per-level renderers.
+    //
+    // Readability rule baked into the type system: things that ARE the same
+    // must LOOK the same. `BlockRenderer` is given only the world-space tile
+    // centre — no (c, r), no way to seed by position — so every interior
+    // pillar and every destructible brick on a level renders identically.
+    // `DecorRenderer` is the one place position-seeded variation is allowed,
+    // and only border walls get it (decorative frame around the arena).
+    pillar_renderer: BlockRenderer;   // interior wall body, same shape every tile
+    brick_renderer:  BlockRenderer;   // destructible block, same shape every tile
+    border_renderer: DecorRenderer;   // arena ring ornaments — may vary by position
 }
+
+BlockRenderer :: #type (cx_w: float, cz_w: float);
+DecorRenderer :: #type (c: int, r: int);
 
 // LevelMechanic is the one place levels hook into the main loop. Add a new
 // level by writing its setup/tick/draw procs and a mechanic constructor that
@@ -284,8 +295,9 @@ volcanic_theme :: () -> Theme {
     t.mote_a = col(1.0,  0.55, 0.18, 1);   // ember orange
     t.mote_b = col(1.0,  0.80, 0.35, 1);   // hot yellow
     t.mote_c = col(0.55, 0.30, 0.20, 1);   // soot brown
-    t.wall_renderer  = draw_wall_volcanic;
-    t.brick_renderer = draw_brick_volcanic;
+    t.pillar_renderer = draw_pillar_volcanic;
+    t.border_renderer = draw_border_volcanic;
+    t.brick_renderer  = draw_brick_volcanic;
     return t;
 }
 
@@ -340,8 +352,9 @@ snow_theme :: () -> Theme {
     t.mote_a = col(1.00, 1.00, 1.00, 1);
     t.mote_b = col(0.78, 0.90, 1.00, 1);
     t.mote_c = col(0.62, 0.78, 0.95, 1);
-    t.wall_renderer  = draw_wall_snow;
-    t.brick_renderer = draw_brick_snow;
+    t.pillar_renderer = draw_pillar_snow;
+    t.border_renderer = draw_border_snow;
+    t.brick_renderer  = draw_brick_snow;
     return t;
 }
 
@@ -396,8 +409,9 @@ pirate_theme :: () -> Theme {
     t.mote_a = col(0.85, 0.70, 0.45, 1);   // dust
     t.mote_b = col(1.00, 0.85, 0.55, 1);   // lantern glow
     t.mote_c = col(0.55, 0.60, 0.70, 1);   // sea spray
-    t.wall_renderer  = draw_wall_pirate;
-    t.brick_renderer = draw_brick_pirate;
+    t.pillar_renderer = draw_pillar_pirate;
+    t.border_renderer = draw_border_pirate;
+    t.brick_renderer  = draw_brick_pirate;
     return t;
 }
 
@@ -452,8 +466,9 @@ beach_theme :: () -> Theme {
     t.mote_a = col(1.00, 0.92, 0.68, 1);
     t.mote_b = col(0.55, 0.85, 1.00, 1);
     t.mote_c = col(1.00, 0.78, 0.45, 1);
-    t.wall_renderer  = draw_wall_beach;
-    t.brick_renderer = draw_brick_beach;
+    t.pillar_renderer = draw_pillar_beach;
+    t.border_renderer = draw_border_beach;
+    t.brick_renderer  = draw_brick_beach;
     return t;
 }
 
@@ -632,6 +647,10 @@ Explosion :: struct {
     timer: int;
     duration: int;
     origin: bool;
+    // Flow direction of this arm tile (cardinal; 0,0 for the origin tile).
+    // is_tip == true for the outermost tile of an arm — gets a rounded cap.
+    dx, dy: int;
+    is_tip: bool;
 }
 
 MeltingBrick :: struct {
@@ -1214,21 +1233,76 @@ project :: (p: Vector3) -> Vector2, bool {
     return .{sx, sy}, true;
 }
 
+// Same projection as `project`, but also returns the post-MVP w value so a
+// 3D draw command can carry its camera-space depth into the back-to-front
+// sort. With our perspective matrix (m._43 = -1), `w` ends up equal to the
+// camera-space distance along the view forward axis: larger w == farther
+// from the camera.
+project_depth :: (p: Vector3) -> Vector2, bool, float {
+    v := cam_mvp * Vector4.{p.x, p.y, p.z, 1};
+    if v.w <= 0.0001 return .{0, 0}, false, 0;
+    inv_w := 1.0 / v.w;
+    sx := (v.x * inv_w + 1.0) * 0.5 * cast(float) WINDOW_W;
+    sy := (1.0 - v.y * inv_w) * 0.5 * cast(float) WINDOW_H;
+    return .{sx, sy}, true, v.w;
+}
+
+// 3D draw command — every triangle or quad that goes through draw_tri_3d
+// or draw_quad_3d ends up in `draw3d_list`. `flush_draw3d` sorts by depth
+// (farthest first) and submits to Simp in one pass.
+Draw3DCmd :: struct {
+    depth: float;
+    n:     int;          // 3 = triangle, 4 = quad
+    p:     [4] Vector2;  // already-projected screen-space verts
+    color: Vector4;
+}
+draw3d_list: [..] Draw3DCmd;
+
 draw_tri_3d :: (a: Vector3, b: Vector3, c: Vector3, color: Vector4) {
-    pa, oa := project(a);
-    pb, ob := project(b);
-    pc, oc := project(c);
+    pa, oa, da := project_depth(a);
+    pb, ob, db := project_depth(b);
+    pc, oc, dc := project_depth(c);
     if !oa || !ob || !oc return;
-    Simp.immediate_triangle(Vector3.{pa.x, pa.y, 0}, Vector3.{pb.x, pb.y, 0}, Vector3.{pc.x, pc.y, 0}, color, color, color);
+    cmd: Draw3DCmd;
+    cmd.depth = (da + db + dc) * (1.0 / 3.0);
+    cmd.n     = 3;
+    cmd.p[0]  = pa; cmd.p[1] = pb; cmd.p[2] = pc;
+    cmd.color = color;
+    array_add(*draw3d_list, cmd);
 }
 
 draw_quad_3d :: (a: Vector3, b: Vector3, c: Vector3, d: Vector3, color: Vector4) {
-    pa, oa := project(a);
-    pb, ob := project(b);
-    pc, oc := project(c);
-    pd, od := project(d);
+    pa, oa, da := project_depth(a);
+    pb, ob, db := project_depth(b);
+    pc, oc, dc := project_depth(c);
+    pd, od, dd := project_depth(d);
     if !oa || !ob || !oc || !od return;
-    Simp.immediate_quad(pa, pb, pc, pd, color);
+    cmd: Draw3DCmd;
+    cmd.depth = (da + db + dc + dd) * 0.25;
+    cmd.n     = 4;
+    cmd.p[0]  = pa; cmd.p[1] = pb; cmd.p[2] = pc; cmd.p[3] = pd;
+    cmd.color = color;
+    array_add(*draw3d_list, cmd);
+}
+
+// Sort queued 3D commands back-to-front and submit them to Simp. Call this
+// at any "barrier" where you want the 3D world flushed before subsequent
+// screen-space (2D) draws composite on top.
+flush_draw3d :: () {
+    if draw3d_list.count == 0 return;
+    quick_sort(draw3d_list, (a, b) => ifx a.depth > b.depth then -1 else ifx a.depth < b.depth then 1 else 0);
+    for cmd: draw3d_list {
+        if cmd.n == 4 {
+            Simp.immediate_quad(cmd.p[0], cmd.p[1], cmd.p[2], cmd.p[3], cmd.color);
+        } else {
+            Simp.immediate_triangle(
+                Vector3.{cmd.p[0].x, cmd.p[0].y, 0},
+                Vector3.{cmd.p[1].x, cmd.p[1].y, 0},
+                Vector3.{cmd.p[2].x, cmd.p[2].y, 0},
+                cmd.color, cmd.color, cmd.color);
+        }
+    }
+    draw3d_list.count = 0;
 }
 
 shade :: (c: Vector4, mul: float) -> Vector4 {
@@ -1268,15 +1342,11 @@ draw_floor_3d :: (c: int, r: int) {
     z0 := cast(float)(r * TILE);
     z1 := z0 + cast(float)TILE;
 
-    base: Vector4;
-    accent: Vector4;
-    if (r + c) % 2 == 0 {
-        base   = current_theme.floor_a_base;
-        accent = current_theme.floor_a_accent;
-    } else {
-        base   = current_theme.floor_b_base;
-        accent = current_theme.floor_b_accent;
-    }
+    // Readability rule: every walkable tile must look identical. No checker,
+    // no per-tile twinkles. Atmospheric variety lives in the overlay (embers,
+    // snowflakes, sea-spray) instead.
+    base   := current_theme.floor_a_base;
+    accent := current_theme.floor_a_accent;
     draw_quad_3d(.{x0, 0, z0}, .{x1, 0, z0}, .{x1, 0, z1}, .{x0, 0, z1}, base);
     inset := 2.0;
     draw_quad_3d(.{x0 + inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z0 + inset}, .{x1 - inset, 0.1, z1 - inset}, .{x0 + inset, 0.1, z1 - inset}, accent);
@@ -1295,24 +1365,27 @@ draw_floor_3d :: (c: int, r: int) {
     if tile_is_solid(c + 1, r) {
         draw_quad_3d(.{x1 - ao_w, 0.2, z0}, .{x1, 0.2, z0}, .{x1, 0.2, z1}, .{x1 - ao_w, 0.2, z1}, ao_c);
     }
+}
 
-    seed := c * 131 + r * 977;
-    if (seed % 4) == 0 {
-        twinkle := 0.45 + (sin(cast(float)frame_count / 30.0 + cast(float)seed) + 1) * 0.30;
-        offset_x := cast(float)(seed % 30) - 15;
-        offset_z := cast(float)((seed / 7) % 30) - 15;
-        cx_w := x0 + cast(float)TILE * 0.5 + offset_x;
-        cz_w := z0 + cast(float)TILE * 0.5 + offset_z;
-        sc, _ := project(.{cx_w, 0.3, cz_w});
-        sp := current_theme.floor_speck;
-        draw_filled_circle(sc.x, sc.y, 1.5, col(sp.x, sp.y, sp.z, twinkle), 6);
+// Wall dispatch. Pillar body (same shape every tile) goes through
+// `BlockRenderer (cx_w, cz_w)`; ring ornaments (allowed to vary by tile)
+// go through `DecorRenderer (c, r)`. Themes can override either or both.
+draw_wall_3d :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+
+    if current_theme.pillar_renderer current_theme.pillar_renderer(cx_w, cz_w);
+    else                              draw_pillar_default(cx_w, cz_w);
+
+    if wall_is_border(c, r) {
+        if current_theme.border_renderer current_theme.border_renderer(c, r);
+        else                              draw_border_default(c, r);
     }
 }
 
-draw_wall_3d :: (c: int, r: int) {
-    if current_theme.wall_renderer { current_theme.wall_renderer(c, r); return; }
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Default pillar — stone cube + edge highlights + mortar cross. Identical
+// for every interior wall tile on themes that don't override it (vanilla).
+draw_pillar_default :: (cx_w: float, cz_w: float) {
     base := current_theme.wall_base;
     top  := current_theme.wall_top;
     draw_cube_3d(cx_w, cz_w, cast(float)TILE * 0.5, cast(float)TILE, top, base);
@@ -1327,21 +1400,24 @@ draw_wall_3d :: (c: int, r: int) {
     draw_quad_3d(.{x0, h, z1}, .{x1, h, z1}, .{x1, h - tr, z1}, .{x0, h - tr, z1}, shade(edge_dark, 1));
     draw_quad_3d(.{x0, h, z0}, .{x0, h, z1}, .{x0, h - tr, z1}, .{x0, h - tr, z0}, shade(edge_dark, 1));
 
-    mortar    := current_theme.wall_mortar;
+    mortar := current_theme.wall_mortar;
     mid_x := (x0 + x1) * 0.5;
     mid_z := (z0 + z1) * 0.5;
     mort_w :: 2.0;
     draw_quad_3d(.{x0 + 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z - mort_w}, .{x1 - 6, h + 0.1, mid_z + mort_w}, .{x0 + 6, h + 0.1, mid_z + mort_w}, mortar);
     draw_quad_3d(.{mid_x - mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z0 + 6}, .{mid_x + mort_w, h + 0.1, z1 - 6}, .{mid_x - mort_w, h + 0.1, z1 - 6}, mortar);
+}
 
-    // Interior pillars stay quiet — no animated rune on top.
-    if !wall_is_border(c, r) return;
-
+// Default border ornament — twin pulsing rune dots whose position rotates
+// per tile so the ring looks decorated, not repetitive.
+draw_border_default :: (c: int, r: int) {
+    x0 := cast(float)(c * TILE);
+    z0 := cast(float)(r * TILE);
+    h  := cast(float)TILE;
     seed := c * 53 + r * 211;
     rune_phase := cast(float)frame_count / 22.0 + cast(float)seed * 0.013;
     rune_pulse := 0.55 + 0.45 * sin(rune_phase);
     rb := current_theme.wall_rune;
-    // Pulse mixes a brighter version of the rune base color toward white.
     rune_c := col(rb.x * (0.7 + 0.3 * rune_pulse) + 0.3 * rune_pulse,
                   rb.y * (0.7 + 0.3 * rune_pulse) + 0.2 * rune_pulse,
                   rb.z * (0.7 + 0.3 * rune_pulse) + 0.1 * rune_pulse, 1);
@@ -1350,16 +1426,21 @@ draw_wall_3d :: (c: int, r: int) {
     draw_quad_3d(.{dot_x - 0.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z - 0.6}, .{dot_x + 3.6, h + 0.18, dot_z + 3.6}, .{dot_x - 0.6, h + 0.18, dot_z + 3.6}, col(rune_c.x, rune_c.y, rune_c.z, 0.30 * rune_pulse));
     draw_quad_3d(.{dot_x, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z}, .{dot_x + 3, h + 0.22, dot_z + 3}, .{dot_x, h + 0.22, dot_z + 3}, rune_c);
 
-    // Border crowns: a second smaller rune dot for a more "decorated edge" feel.
     dot2_x := x0 + cast(float)((seed * 7) % 18) + 22;
     dot2_z := z0 + cast(float)((seed * 11 / 5) % 18) + 22;
     draw_quad_3d(.{dot2_x, h + 0.22, dot2_z}, .{dot2_x + 2, h + 0.22, dot2_z}, .{dot2_x + 2, h + 0.22, dot2_z + 2}, .{dot2_x, h + 0.22, dot2_z + 2}, col(rune_c.x, rune_c.y, rune_c.z, rune_pulse * 0.85));
 }
 
+// Brick dispatch — `BlockRenderer (cx_w, cz_w)` is the only signature, so
+// every brick on a level lands the same shape at its tile centre.
 draw_brick_3d :: (c: int, r: int) {
-    if current_theme.brick_renderer { current_theme.brick_renderer(c, r); return; }
     cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
     cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    if current_theme.brick_renderer current_theme.brick_renderer(cx_w, cz_w);
+    else                             draw_brick_default(cx_w, cz_w);
+}
+
+draw_brick_default :: (cx_w: float, cz_w: float) {
     h := cast(float)TILE * 0.72;
     base := current_theme.brick_base;
     top  := current_theme.brick_top;
@@ -1382,17 +1463,18 @@ draw_brick_3d :: (c: int, r: int) {
 
     draw_quad_3d(.{x0 + 8, h + 0.15, z0 + 8}, .{x1 - 8, h + 0.15, z0 + 8}, .{x1 - 8, h + 0.15, z1 - 8}, .{x0 + 8, h + 0.15, z1 - 8}, inner);
 
-    seed := c * 7 + r * 13;
+    // Three deterministic grain ribbons.
     for i: 0..2 {
-        gx0 := x0 + cast(float)((seed * (i + 1)) % 24) + 6;
-        gz  := z0 + cast(float)(((seed * 3) + i * 11) % 20) + 10;
-        draw_quad_3d(.{gx0, h + 0.2, gz}, .{gx0 + 8, h + 0.2, gz}, .{gx0 + 8, h + 0.2, gz + 1.2}, .{gx0, h + 0.2, gz + 1.2}, grain);
+        t := (cast(float) i + 1.0) / 4.0;
+        gz := z0 + t * (z1 - z0);
+        draw_quad_3d(.{x0 + 10, h + 0.2, gz}, .{x1 - 10, h + 0.2, gz},
+                     .{x1 - 10, h + 0.2, gz + 1.2}, .{x0 + 10, h + 0.2, gz + 1.2}, grain);
     }
 
-    offset := cast(float)((seed % 18) - 8);
-    bx := cx_w - 14 + offset;
+    // Centred label band on the front face.
     z_face := cz_w + half + 0.5;
-    draw_quad_3d(.{bx, h * 0.4, z_face}, .{bx + 10, h * 0.4, z_face}, .{bx + 10, h * 0.4 + 4, z_face}, .{bx, h * 0.4 + 4, z_face}, current_theme.brick_face);
+    draw_quad_3d(.{cx_w - 5, h * 0.4, z_face}, .{cx_w + 5, h * 0.4, z_face},
+                 .{cx_w + 5, h * 0.4 + 4, z_face}, .{cx_w - 5, h * 0.4 + 4, z_face}, current_theme.brick_face);
 }
 
 // ── Custom per-theme wall/brick renderers ───────────────────────────────────
@@ -1421,45 +1503,49 @@ wall_is_border :: (c: int, r: int) -> bool {
     return c == 0 || c == COLS - 1 || r == 0 || r == ROWS - 1;
 }
 
-draw_wall_volcanic :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Volcanic pillar body — obsidian cube with a centred magma vein. Identical
+// on every interior wall tile, no position-seeded variation.
+draw_pillar_volcanic :: (cx_w: float, cz_w: float) {
     half := cast(float)TILE * 0.5;
     h    := cast(float)TILE;
-    // Obsidian-like dark rock.
     base := col(0.18, 0.12, 0.10, 1);
     top  := col(0.36, 0.24, 0.20, 1);
     draw_cube_3d(cx_w, cz_w, half, h, top, base);
 
     x0 := cx_w - half;
     x1 := cx_w + half;
-    z0 := cz_w - half;
+    pulse := 0.65 + 0.35 * sin(cast(float)frame_count / 8.0);
+    vein  := col(1.0, 0.45 * pulse + 0.30, 0.15 * pulse, 0.55);
+    draw_quad_3d(.{x0 + 6, h + 0.08, cz_w - 1.5},
+                 .{x1 - 6, h + 0.08, cz_w - 1.5},
+                 .{x1 - 6, h + 0.08, cz_w + 1.5},
+                 .{x0 + 6, h + 0.08, cz_w + 1.5}, vein);
+}
+
+// Volcanic border ornaments — brighter core line, lava drip on the front
+// face, floating ember above. Position-seeded on purpose so the arena ring
+// feels lived-in.
+draw_border_volcanic :: (c: int, r: int) {
+    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.5;
+    h    := cast(float)TILE;
+    x0 := cx_w - half;
+    x1 := cx_w + half;
     z1 := cz_w + half;
 
-    border := wall_is_border(c, r);
     seed := c * 73 + r * 211;
-
-    // Glowing magma vein across the top face — same shape both border and
-    // interior, but border veins pulse hotter so the edge feels alive.
     pulse := 0.65 + 0.35 * sin(cast(float)frame_count / 8.0 + cast(float)seed * 0.04);
-    vein_a := ifx border then pulse else 0.55;
-    vein  := col(1.0, 0.45 * pulse + 0.30, 0.15 * pulse, vein_a);
+
+    // Hot core line on top of the vein.
     voff := cast(float)((seed % 16) - 8);
-    draw_quad_3d(.{x0 + 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
-                 .{x1 - 6, h + 0.08, cz_w - 1.5 + voff * 0.2},
-                 .{x1 - 6, h + 0.08, cz_w + 1.5 + voff * 0.2},
-                 .{x0 + 6, h + 0.08, cz_w + 1.5 + voff * 0.2}, vein);
-    if border {
-        core := col(1.0, 0.92, 0.70, pulse);
-        draw_quad_3d(.{x0 + 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
-                     .{x1 - 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
-                     .{x1 - 8, h + 0.14, cz_w + 0.4 + voff * 0.2},
-                     .{x0 + 8, h + 0.14, cz_w + 0.4 + voff * 0.2}, core);
-    }
+    core := col(1.0, 0.92, 0.70, pulse);
+    draw_quad_3d(.{x0 + 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                 .{x1 - 8, h + 0.14, cz_w - 0.4 + voff * 0.2},
+                 .{x1 - 8, h + 0.14, cz_w + 0.4 + voff * 0.2},
+                 .{x0 + 8, h + 0.14, cz_w + 0.4 + voff * 0.2}, core);
 
-    if !border return;
-
-    // Lava drip from top edge of the front face — border-only flourish.
+    // Lava drip from top edge of the front face.
     drip_x := x0 + 10 + cast(float)((seed * 3) % 30);
     drip_top  := col(1.0, 0.55, 0.18, 1);
     drip_glow := col(1.0, 0.30, 0.10, 0.55);
@@ -1479,9 +1565,7 @@ draw_wall_volcanic :: (c: int, r: int) {
 
 // Mine rubble with a glowing ore vein on the top face — gives bricks a clear
 // "this is the inside of a volcano mine" read instead of plain weathered stone.
-draw_brick_volcanic :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+draw_brick_volcanic :: (cx_w: float, cz_w: float) {
     h := cast(float)TILE * 0.72;
     half := cast(float)TILE * 0.45;
     base := col(0.28, 0.17, 0.10, 1);
@@ -1501,29 +1585,28 @@ draw_brick_volcanic :: (c: int, r: int) {
     draw_quad_3d(.{x0, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
     draw_quad_3d(.{x1 - rim_w, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z1}, .{x1 - rim_w, h + 0.05, z1}, rim);
 
-    seed := c * 47 + r * 19;
-    pulse := 0.55 + 0.45 * sin(cast(float)frame_count / 9.0 + cast(float)seed * 0.05);
+    // Every brick pulses on the same global beat so they read as one type.
+    pulse := 0.55 + 0.45 * sin(cast(float)frame_count / 9.0);
 
-    // Pulsing ore vein crossing the top face diagonally — the "live magma in
-    // the rock" hook the level was missing.
+    // Centred ore vein crossing the top face — same on every brick.
     vein_d := col(1.0, 0.30, 0.08, 0.85);
     vein_h := col(1.0, 0.92, 0.60, pulse);
-    voff := cast(float)((seed % 12) - 6);
-    draw_quad_3d(.{x0 + 6, h + 0.10, cz_w - 2 + voff * 0.3},
-                 .{x1 - 6, h + 0.10, cz_w - 2 + voff * 0.3},
-                 .{x1 - 6, h + 0.10, cz_w + 2 + voff * 0.3},
-                 .{x0 + 6, h + 0.10, cz_w + 2 + voff * 0.3}, vein_d);
-    draw_quad_3d(.{x0 + 10, h + 0.16, cz_w - 0.6 + voff * 0.3},
-                 .{x1 - 10, h + 0.16, cz_w - 0.6 + voff * 0.3},
-                 .{x1 - 10, h + 0.16, cz_w + 0.6 + voff * 0.3},
-                 .{x0 + 10, h + 0.16, cz_w + 0.6 + voff * 0.3}, vein_h);
+    draw_quad_3d(.{x0 + 6, h + 0.10, cz_w - 2},
+                 .{x1 - 6, h + 0.10, cz_w - 2},
+                 .{x1 - 6, h + 0.10, cz_w + 2},
+                 .{x0 + 6, h + 0.10, cz_w + 2}, vein_d);
+    draw_quad_3d(.{x0 + 10, h + 0.16, cz_w - 0.6},
+                 .{x1 - 10, h + 0.16, cz_w - 0.6},
+                 .{x1 - 10, h + 0.16, cz_w + 0.6},
+                 .{x0 + 10, h + 0.16, cz_w + 0.6}, vein_h);
 
-    // Ore flecks on the front face — looks like embedded mineral.
+    // Three evenly-spaced ore flecks on the front face — deterministic.
     flec := col(1.0, 0.65, 0.20, 1);
     for i: 0..2 {
-        fx := x0 + 6 + cast(float)((seed * (i + 3)) % 26);
-        fy := h * 0.25 + cast(float)((seed * (i + 5)) % 30) * 0.4;
-        draw_quad_3d(.{fx, fy, z1 + 0.1}, .{fx + 2.4, fy, z1 + 0.1}, .{fx + 2.4, fy + 2.4, z1 + 0.1}, .{fx, fy + 2.4, z1 + 0.1}, flec);
+        fx := x0 + 8 + cast(float)i * (cast(float)TILE * 0.30);
+        fy := h * 0.40;
+        draw_quad_3d(.{fx, fy, z1 + 0.1}, .{fx + 2.4, fy, z1 + 0.1},
+                     .{fx + 2.4, fy + 2.4, z1 + 0.1}, .{fx, fy + 2.4, z1 + 0.1}, flec);
     }
 }
 
@@ -1560,54 +1643,42 @@ draw_volcanic_overlay :: () {
     }
 }
 
-draw_wall_snow :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Snow pillar body — packed-ice cube with a wider snow cap. Same on every
+// interior wall tile.
+draw_pillar_snow :: (cx_w: float, cz_w: float) {
     half := cast(float)TILE * 0.5;
     h_body := cast(float)TILE * 0.78;
     base := col(0.42, 0.62, 0.86, 1);
     top  := col(0.78, 0.92, 1.00, 1);
     draw_cube_3d(cx_w, cz_w, half, h_body, top, base);
-
-    // Wider snow cap.
     cap_h := h_body + cast(float)TILE * 0.10;
     draw_cube_3d(cx_w, cz_w, half - 1.5, cap_h, col(1, 1, 1, 1), col(0.88, 0.95, 1.00, 1));
+}
 
-    // Interior pillars stop at the snow cap — the snowman is a border-only treat.
-    if !wall_is_border(c, r) return;
-
-    // Snowman head perched on top — a clear "cute thing".
+// Snow border ornament — a perched snowman.
+draw_border_snow :: (c: int, r: int) {
     seed := c * 73 + r * 137;
     sx, sy, s := wall_top_screen(c, r, 1.0);
     bob := sin(cast(float)frame_count / 22.0 + cast(float)seed * 0.05) * 1.2;
     head_y := sy - 18 + bob;
     head_r := 11.0 * s;
-    // Shadow under head
     draw_filled_ellipse(sx, sy - 4, head_r * 1.2, head_r * 0.45, col(0.20, 0.30, 0.45, 0.45));
-    // Body
     draw_filled_circle(sx, head_y + 6, head_r * 0.95, col(0.92, 0.97, 1.00, 1), 18);
-    // Head
     draw_filled_circle(sx, head_y, head_r * 0.78, col(1.00, 1.00, 1.00, 1), 18);
-    // Coal eyes
     draw_filled_circle(sx - head_r * 0.28, head_y - head_r * 0.10, head_r * 0.13, col(0.10, 0.10, 0.18, 1), 8);
     draw_filled_circle(sx + head_r * 0.28, head_y - head_r * 0.10, head_r * 0.13, col(0.10, 0.10, 0.18, 1), 8);
-    // Carrot nose
     nose_c := col(1.00, 0.55, 0.18, 1);
     draw_triangle(sx, head_y + 1, sx + head_r * 0.85, head_y - 1, sx + 1, head_y + 4, nose_c);
-    // Tiny smile dots
     draw_filled_circle(sx - head_r * 0.30, head_y + head_r * 0.30, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
     draw_filled_circle(sx,                  head_y + head_r * 0.38, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
     draw_filled_circle(sx + head_r * 0.30, head_y + head_r * 0.30, 1.4 * s, col(0.10, 0.10, 0.18, 1), 6);
 
-    // Twinkles next to the snowman.
     pulse := 0.4 + 0.6 * sin(cast(float)frame_count / 11.0 + cast(float)seed * 0.05);
     draw_filled_circle(sx - head_r * 1.6, head_y - 4, 1.6 * pulse * s, col(1, 1, 1, pulse), 6);
     draw_filled_circle(sx + head_r * 1.6, head_y + 2, 1.4 * pulse * s, col(1, 1, 1, pulse), 6);
 }
 
-draw_brick_snow :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+draw_brick_snow :: (cx_w: float, cz_w: float) {
     h := cast(float)TILE * 0.50;
     half := cast(float)TILE * 0.40;
     base := col(0.85, 0.92, 1.00, 1);
@@ -1623,20 +1694,19 @@ draw_brick_snow :: (c: int, r: int) {
     pile_h := h + cast(float)TILE * 0.18;
     draw_cube_3d(cx_w, cz_w, half - 4.0, pile_h, col(1, 1, 1, 1), col(0.94, 0.97, 1.00, 1));
 
-    // Sparkles
-    seed := c * 41 + r * 19;
-    pulse := 0.5 + 0.5 * sin(cast(float)frame_count / 9.0 + cast(float)seed * 0.03);
-    for i: 0..2 {
-        sx := x0 + 6 + cast(float)((seed * (i + 1)) % 18);
-        sz := z0 + 6 + cast(float)((seed * 3 + i * 11) % 18);
-        a := pulse * (0.5 + cast(float)i * 0.2);
-        draw_quad_3d(.{sx, pile_h + 0.2, sz}, .{sx + 1.6, pile_h + 0.2, sz}, .{sx + 1.6, pile_h + 0.2, sz + 1.6}, .{sx, pile_h + 0.2, sz + 1.6}, col(1, 1, 1, a));
-    }
+    // Single centred sparkle pulsing on a shared beat — every snow brick
+    // reads the same.
+    pulse := 0.5 + 0.5 * sin(cast(float)frame_count / 9.0);
+    draw_quad_3d(.{cx_w - 1.4, pile_h + 0.2, cz_w - 1.4},
+                 .{cx_w + 1.4, pile_h + 0.2, cz_w - 1.4},
+                 .{cx_w + 1.4, pile_h + 0.2, cz_w + 1.4},
+                 .{cx_w - 1.4, pile_h + 0.2, cz_w + 1.4}, col(1, 1, 1, pulse));
 }
 
-draw_wall_pirate :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Pirate pillar body — wood hull cube with vertical plank seams. Same on
+// every interior tile so the deck doesn't fight the cannon fire lanes for
+// attention.
+draw_pillar_pirate :: (cx_w: float, cz_w: float) {
     half := cast(float)TILE * 0.5;
     h := cast(float)TILE;
     base := col(0.24, 0.15, 0.09, 1);
@@ -1644,24 +1714,21 @@ draw_wall_pirate :: (c: int, r: int) {
     draw_cube_3d(cx_w, cz_w, half, h, top, base);
 
     x0 := cx_w - half;
-    x1 := cx_w + half;
     z1 := cz_w + half;
 
-    // Vertical plank seams on the front face — quick "wood" tell.
     seam := col(0.10, 0.05, 0.03, 1);
     for i: 1..2 {
         px := x0 + cast(float)TILE * cast(float) i / 3.0;
-        draw_quad_3d(.{px - 0.8, 0.05, z1 + 0.1}, .{px + 0.8, 0.05, z1 + 0.1}, .{px + 0.8, h - 0.05, z1 + 0.1}, .{px - 0.8, h - 0.05, z1 + 0.1}, seam);
+        draw_quad_3d(.{px - 0.8, 0.05, z1 + 0.1}, .{px + 0.8, 0.05, z1 + 0.1},
+                     .{px + 0.8, h - 0.05, z1 + 0.1}, .{px - 0.8, h - 0.05, z1 + 0.1}, seam);
     }
+}
 
-    // Interior pillars on the cannon deck stay quiet — no rope, flag, or
-    // pulsing brass to distract from the cannon fire lanes.
-    if !wall_is_border(c, r) return;
-
+// Pirate border ornament — rope coil + skull/red flag on a pole.
+draw_border_pirate :: (c: int, r: int) {
     seed := c * 41 + r * 73;
     sx, sy, s := wall_top_screen(c, r, 1.0);
 
-    // Rope coil sitting on top — a brown annulus.
     coil_outer := col(0.62, 0.40, 0.20, 1);
     coil_mid   := col(0.78, 0.52, 0.26, 1);
     coil_inner := col(0.32, 0.18, 0.08, 1);
@@ -1670,7 +1737,6 @@ draw_wall_pirate :: (c: int, r: int) {
     draw_filled_circle(sx, sy - 4, coil_r,        coil_outer, 18);
     draw_filled_circle(sx, sy - 4, coil_r * 0.85, coil_mid,   18);
     draw_filled_circle(sx, sy - 4, coil_r * 0.40, coil_inner, 14);
-    // Coil grain — couple of arcs.
     for i: 0..6 {
         ang := (cast(float)i / 7.0) * TAU + cast(float)frame_count * 0.005;
         px := sx + cos(ang) * coil_r * 0.72;
@@ -1678,7 +1744,6 @@ draw_wall_pirate :: (c: int, r: int) {
         draw_filled_circle(px, py, 1.2 * s, coil_inner, 6);
     }
 
-    // Little flag on a pole — sticks up over the rope.
     flag_sway := sin(cast(float)frame_count / 18.0 + cast(float)seed * 0.07) * 1.5;
     pole_top_y := sy - 38;
     pole_bot_y := sy - 6;
@@ -1687,72 +1752,17 @@ draw_wall_pirate :: (c: int, r: int) {
     draw_triangle(sx + 6, pole_top_y,
                   sx + 22 + flag_sway, pole_top_y + 4,
                   sx + 6, pole_top_y + 10, flag_c);
-    // Skull dot on the flag for the dark version.
     if (seed % 2) != 0 {
         draw_filled_circle(sx + 13 + flag_sway * 0.5, pole_top_y + 5, 1.6 * s, col(0.95, 0.95, 0.90, 1), 6);
     }
 
-    // Brass-glint accent
     pulse := 0.5 + 0.5 * sin(cast(float)frame_count / 4.0);
     draw_filled_circle(sx + 6, pole_top_y, 2.0 * pulse, col(1, 0.92, 0.65, pulse), 6);
 }
 
-draw_brick_pirate :: (c: int, r: int) {
-    seed := c * 7 + r * 11;
-    // Half the bricks render as wooden barrels (round silhouette, brass
-    // hoops) instead of crates — a 50/50 mix gives the deck a "cargo
-    // strewn across the boards" look instead of an endless crate maze.
-    if (seed % 2) == 0 {
-        draw_brick_pirate_barrel(c, r, seed);
-        return;
-    }
-
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
-    h := cast(float)TILE * 0.70;
-    half := cast(float)TILE * 0.42;
-    base := col(0.50, 0.34, 0.20, 1);
-    top  := col(0.74, 0.54, 0.32, 1);
-    draw_cube_3d(cx_w, cz_w, half, h, top, base);
-
-    x0 := cx_w - half;
-    x1 := cx_w + half;
-    z0 := cz_w - half;
-    z1 := cz_w + half;
-
-    // Edge rim on the top face — picture-frame look.
-    rim := col(0.28, 0.18, 0.10, 1);
-    rim_w :: 2.6;
-    draw_quad_3d(.{x0, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z0 + rim_w}, .{x0, h + 0.05, z0 + rim_w}, rim);
-    draw_quad_3d(.{x0, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1 - rim_w}, .{x1, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
-    draw_quad_3d(.{x0, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z0}, .{x0 + rim_w, h + 0.05, z1}, .{x0, h + 0.05, z1}, rim);
-    draw_quad_3d(.{x1 - rim_w, h + 0.05, z0}, .{x1, h + 0.05, z0}, .{x1, h + 0.05, z1}, .{x1 - rim_w, h + 0.05, z1}, rim);
-
-    // X-cross on top to read as a crate.
-    cross := col(0.28, 0.18, 0.10, 1);
-    cross_w :: 3.0;
-    in_x0 := x0 + rim_w + 2;
-    in_x1 := x1 - rim_w - 2;
-    in_z0 := z0 + rim_w + 2;
-    in_z1 := z1 - rim_w - 2;
-    draw_quad_3d(.{in_x0, h + 0.10, in_z0}, .{in_x0 + cross_w, h + 0.10, in_z0}, .{in_x1, h + 0.10, in_z1}, .{in_x1 - cross_w, h + 0.10, in_z1}, cross);
-    draw_quad_3d(.{in_x1 - cross_w, h + 0.10, in_z0}, .{in_x1, h + 0.10, in_z0}, .{in_x0 + cross_w, h + 0.10, in_z1}, .{in_x0, h + 0.10, in_z1}, cross);
-
-    // Tag on the front face.
-    label_bg := col(0.86, 0.78, 0.52, 1);
-    label_edge := col(0.40, 0.30, 0.16, 1);
-    fy := h * 0.40;
-    off := cast(float)((seed % 8) - 4);
-    draw_quad_3d(.{cx_w - 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy - 1, z1 + 0.1}, .{cx_w + 9 + off, fy + 9, z1 + 0.1}, .{cx_w - 9 + off, fy + 9, z1 + 0.1}, label_edge);
-    draw_quad_3d(.{cx_w - 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy, z1 + 0.15}, .{cx_w + 8 + off, fy + 8, z1 + 0.15}, .{cx_w - 8 + off, fy + 8, z1 + 0.15}, label_bg);
-}
-
-// Wooden cargo barrel — three brass hoops + tapered staves on the front
-// face, a circular plank lid on top. Stands in for half the destructibles
-// on the pirate deck so the level reads as ship cargo, not crates only.
-draw_brick_pirate_barrel :: (c: int, r: int, seed: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Every pirate destructible is a wooden cargo barrel — uniform silhouette
+// so players spot destructibles at a glance.
+draw_brick_pirate :: (cx_w: float, cz_w: float) {
     h    := cast(float)TILE * 0.72;
     half := cast(float)TILE * 0.40;
     base := col(0.42, 0.26, 0.14, 1);
@@ -1810,9 +1820,9 @@ draw_brick_pirate_barrel :: (c: int, r: int, seed: int) {
                  .{cx_w + 0.5, h + 0.14, cz_w + cp}, .{cx_w - 0.5, h + 0.14, cz_w + cp}, lid_dark);
 }
 
-draw_wall_beach :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+// Beach pillar body — weathered wood post with horizontal grain. Same on
+// every interior tile.
+draw_pillar_beach :: (cx_w: float, cz_w: float) {
     half := cast(float)TILE * 0.46;
     h := cast(float)TILE * 0.92;
     base := col(0.38, 0.30, 0.22, 1);
@@ -1823,16 +1833,17 @@ draw_wall_beach :: (c: int, r: int) {
     x1 := cx_w + half;
     z1 := cz_w + half;
 
-    // Horizontal grain bands on the face.
     grain := col(0.20, 0.14, 0.08, 1);
     for i: 1..3 {
         gy := h * cast(float)i / 4.0;
-        draw_quad_3d(.{x0 + 3, gy, z1 + 0.1}, .{x1 - 3, gy, z1 + 0.1}, .{x1 - 3, gy + 0.8, z1 + 0.1}, .{x0 + 3, gy + 0.8, z1 + 0.1}, grain);
+        draw_quad_3d(.{x0 + 3, gy, z1 + 0.1}, .{x1 - 3, gy, z1 + 0.1},
+                     .{x1 - 3, gy + 0.8, z1 + 0.1}, .{x0 + 3, gy + 0.8, z1 + 0.1}, grain);
     }
+}
 
-    // Interior pillars get the wood post without the ornament on top.
-    if !wall_is_border(c, r) return;
-
+// Beach border ornaments — three flavours (starfish / seashells / palm fan)
+// picked deterministically from the tile seed.
+draw_border_beach :: (c: int, r: int) {
     seed := c * 23 + r * 41;
     sx, sy, s := wall_top_screen(c, r, 0.92);
     pick := seed % 3;
@@ -1921,9 +1932,7 @@ draw_wall_beach :: (c: int, r: int) {
     }
 }
 
-draw_brick_beach :: (c: int, r: int) {
-    cx_w := cast(float)(c * TILE) + cast(float)TILE * 0.5;
-    cz_w := cast(float)(r * TILE) + cast(float)TILE * 0.5;
+draw_brick_beach :: (cx_w: float, cz_w: float) {
     // Driftwood log lying flat.
     h := cast(float)TILE * 0.45;
     half := cast(float)TILE * 0.42;
@@ -1951,14 +1960,14 @@ draw_brick_beach :: (c: int, r: int) {
     }
     draw_quad_3d(.{cx_w - 2, h + 0.12, cz_w - 2}, .{cx_w + 2, h + 0.12, cz_w - 2}, .{cx_w + 2, h + 0.12, cz_w + 2}, .{cx_w - 2, h + 0.12, cz_w + 2}, ring3);
 
-    // Knot on the front face.
+    // Knot on the front face — centred so every driftwood log reads the same.
     knot_d := col(0.20, 0.12, 0.06, 1);
     knot_l := col(0.40, 0.26, 0.14, 1);
-    seed := c * 11 + r * 29;
-    kx := cx_w - 6 + cast(float)((seed % 14) - 7);
     ky := h * 0.4;
-    draw_quad_3d(.{kx - 3, ky - 1, z1 + 0.1}, .{kx + 3, ky - 1, z1 + 0.1}, .{kx + 3, ky + 7, z1 + 0.1}, .{kx - 3, ky + 7, z1 + 0.1}, knot_d);
-    draw_quad_3d(.{kx - 1.5, ky + 1, z1 + 0.15}, .{kx + 1.5, ky + 1, z1 + 0.15}, .{kx + 1.5, ky + 5, z1 + 0.15}, .{kx - 1.5, ky + 5, z1 + 0.15}, knot_l);
+    draw_quad_3d(.{cx_w - 3, ky - 1, z1 + 0.1}, .{cx_w + 3, ky - 1, z1 + 0.1},
+                 .{cx_w + 3, ky + 7, z1 + 0.1}, .{cx_w - 3, ky + 7, z1 + 0.1}, knot_d);
+    draw_quad_3d(.{cx_w - 1.5, ky + 1, z1 + 0.15}, .{cx_w + 1.5, ky + 1, z1 + 0.15},
+                 .{cx_w + 1.5, ky + 5, z1 + 0.15}, .{cx_w - 1.5, ky + 5, z1 + 0.15}, knot_l);
 }
 
 draw_background :: () {
@@ -2127,8 +2136,56 @@ draw_floor_light :: (cx_w: float, cz_w: float, world_radius: float, color: Vecto
     }
 }
 
+draw_bomb_sigil :: (cx_w: float, cz_w: float, danger: float, color: Vector4) {
+    // Slow-rotating hexagram + rune dots on the floor, perspective-flattened.
+    s := screen_scale_at(.{cx_w, 0.4, cz_w});
+    sc, _ := project(.{cx_w, 0.4, cz_w});
+    rx := cast(float)TILE * 0.62 * s;
+    if rx < 1 return;
+    ry := rx * 0.5;
+    rot := cast(float)frame_count / (80.0 - danger * 20.0);
+    a := 0.55 + danger * 0.30;
+
+    // Outer rune ring — small dots that orbit the tile.
+    runes :: 8;
+    for i: 0..runes-1 {
+        ang := rot + cast(float)i * (TAU / cast(float)runes);
+        px := sc.x + cos(ang) * rx;
+        py := sc.y + sin(ang) * ry;
+        draw_filled_circle(px, py, 2.4, col(color.x, color.y, color.z, a * 0.85), 6);
+        draw_filled_circle(px, py, 1.1, col(1, 1, 1, a * 0.90), 5);
+    }
+
+    // Two interlocking triangles → hexagram. Each leg drawn as a thin chain
+    // of dots so it reads cleanly under the perspective flatten.
+    star_r_x := rx * 0.92;
+    star_r_y := ry * 0.92;
+    for tri: 0..1 {
+        base_ang := rot * 0.6 + cast(float)tri * (PI / 3.0);
+        for leg: 0..2 {
+            a0 := base_ang + cast(float)leg * (TAU / 3.0);
+            a1 := base_ang + cast(float)(leg + 1) * (TAU / 3.0);
+            x0 := sc.x + cos(a0) * star_r_x;
+            y0 := sc.y + sin(a0) * star_r_y;
+            x1 := sc.x + cos(a1) * star_r_x;
+            y1 := sc.y + sin(a1) * star_r_y;
+            segs :: 10;
+            for k: 0..segs-1 {
+                t := cast(float)k / cast(float)(segs - 1);
+                px := x0 * (1.0 - t) + x1 * t;
+                py := y0 * (1.0 - t) + y1 * t;
+                draw_filled_circle(px, py, 1.4, col(color.x, color.y, color.z, a * 0.55), 5);
+            }
+        }
+    }
+
+    // Bright sigil core dot — pulses with danger.
+    core_p := 0.7 + sin(cast(float)frame_count / 5.0) * 0.30;
+    draw_filled_circle(sc.x, sc.y, 3.0 + danger * 1.5, col(1, 1, 1, a * core_p), 8);
+}
+
 draw_floor_lights :: () {
-    // Bombs: pulsing magenta pools, intensity rises near detonation.
+    // Bombs: pulsing magenta pools + slow-spinning magic sigil on the floor.
     for bombs {
         if it.punching continue;
         if it.x < 0 || it.y < 0 continue;
@@ -2141,6 +2198,7 @@ draw_floor_lights :: () {
         glow_c := col(0.702, 0.404, 1.0, 1);
         if danger > 0.65 glow_c = col(1.0, 0.55, 0.78, 1);
         draw_floor_light(cx_w, cz_w, radius, glow_c, (0.65 + danger * 0.45) * pulse);
+        draw_bomb_sigil(cx_w, cz_w, danger, glow_c);
     }
 
     // Powerups: gentle pool of their own color.
@@ -2538,71 +2596,113 @@ draw_bomb :: (b: Bomb, bx: float, by: float) {
     pulse_rate := 4.0 - danger * 2.5;
     if pulse_rate < 1.2 pulse_rate = 1.2;
     pulse := sin(cast(float)frame_count / pulse_rate) * (2.5 + danger * 5.0);
-    r := 11 + pulse;
+    r := 11.0 + pulse;
+    seed := cast(float)(b.x * 53 + b.y * 17);
 
-    // Drop shadow under the bomb (tilted ellipse for perspective)
-    draw_filled_ellipse(bx, by + r + 1, r * 1.05, 3.5, col(0, 0, 0, 0.50));
+    // Ground shadow sits below the hover bob (caller offsets bx,by upward).
+    draw_filled_ellipse(bx, by + r + 5, r * 1.10, 3.0, col(0, 0, 0, 0.42));
 
-    // Pulsing aura — magenta near boom, lavender otherwise
-    aura_col := mix4(col(0.722, 0.498, 1.0, 1), col(1.0, 0.55, 0.78, 1), danger);
+    // Outer aura — lavender at idle, hot magenta near detonation.
+    aura_col := mix4(col(0.55, 0.30, 1.0, 1), col(1.0, 0.40, 0.78, 1), danger);
     aura_pulse := 0.7 + sin(cast(float)frame_count / 6.0) * 0.30;
-    for i: 0..3 {
-        rr := r + 5.0 + cast(float)i * 5.5;
-        a := (0.32 - cast(float)i * 0.075) * aura_pulse;
-        if a > 0 draw_filled_circle(bx, by, rr, col(aura_col.x, aura_col.y, aura_col.z, a), 16);
+    for i: 0..4 {
+        rr := r + 4.0 + cast(float)i * 6.0;
+        a := (0.30 - cast(float)i * 0.055) * aura_pulse;
+        if a > 0 draw_filled_circle(bx, by, rr, col(aura_col.x, aura_col.y, aura_col.z, a), 20);
     }
 
-    // Body — darker rim, mid, highlight
-    body_dark := col(0.235, 0.063, 0.392, 1);
-    body_mid  := col(0.486, 0.302, 1.0, 1);
-    body_hi   := col(0.737, 0.604, 1.0, 1);
-    draw_filled_circle(bx, by, r,           body_dark, 18);
-    draw_filled_circle(bx, by, r - 1.6,     body_mid,  18);
-    draw_filled_circle(bx - r * 0.30, by - r * 0.32, r * 0.36, body_hi, 12);
-    draw_filled_circle(bx - r * 0.40, by - r * 0.42, r * 0.18, col(1, 1, 1, 0.65), 8);
+    // Crystalline orb body — rim + translucent core.
+    body_dark := col(0.18, 0.06, 0.40, 1);
+    body_mid  := mix4(col(0.45, 0.20, 1.0, 1), col(0.95, 0.35, 0.78, 1), danger);
+    draw_filled_circle(bx, by, r,       body_dark, 22);
+    draw_filled_circle(bx, by, r - 1.6, body_mid,  22);
 
-    // Equator highlight (subtle scanline)
-    Simp.immediate_quad(bx - r * 0.85, by - 0.7, bx + r * 0.85, by + 0.7, col(0.88, 0.78, 1.0, 0.18));
+    // Inner swirling mana — three soft blobs that orbit inside the orb.
+    swirl_t := cast(float)frame_count / (12.0 - danger * 6.0);
+    for i: 0..2 {
+        ang := swirl_t + cast(float)i * (TAU / 3.0) + seed * 0.01;
+        sx := bx + cos(ang) * r * 0.42;
+        sy := by + sin(ang) * r * 0.28;
+        draw_filled_circle(sx, sy, r * 0.42, col(1.0, 0.85, 1.0, 0.18), 14);
+        draw_filled_circle(sx, sy, r * 0.24, col(1.0, 0.95, 1.0, 0.45), 12);
+    }
 
-    // Plasma arc skating across the bomb near detonation
-    if danger > 0.55 {
-        arc_phase := cast(float)frame_count / 2.0;
-        if sin(arc_phase + cast(float)(b.x * 7 + b.y * 11)) > 0.0 {
-            ax := bx + cos(arc_phase * 0.7) * r * 0.45;
-            ay := by + sin(arc_phase * 0.9) * r * 0.45;
-            bx2 := bx + cos(arc_phase * 0.7 + 2.0) * r * 0.45;
-            by2 := by + sin(arc_phase * 0.9 + 2.4) * r * 0.45;
-            draw_line(ax, ay, bx2, by2, col(1, 0.92, 1.0, 0.85), 1.4);
+    // Glassy specular — sells the "orb of mana" read.
+    draw_filled_circle(bx - r * 0.30, by - r * 0.34, r * 0.36, col(1, 0.96, 1, 0.55), 12);
+    draw_filled_circle(bx - r * 0.42, by - r * 0.46, r * 0.18, col(1, 1, 1, 0.90), 8);
+
+    // Equator band — a thin rune ring around the orb.
+    band_a := 0.32 + danger * 0.30;
+    draw_filled_rect(bx - r * 0.92, by - 0.8, r * 1.84, 1.6, col(0.92, 0.78, 1.0, band_a));
+
+    // Crackling plasma arcs — more, longer, jaggier as the fuse runs out.
+    if danger > 0.25 {
+        arcs := 1 + cast(int)(danger * 3.0);
+        for i: 0..arcs-1 {
+            arc_phase := cast(float)frame_count / 2.0 + cast(float)i * 1.7 + seed * 0.013;
+            if sin(arc_phase) > 0.0 {
+                ang1 := arc_phase * 0.7;
+                ang2 := ang1 + 2.0 + sin(arc_phase * 0.3) * 0.6;
+                ax := bx + cos(ang1) * r * 0.85;
+                ay := by + sin(ang1) * r * 0.55;
+                ex := bx + cos(ang2) * r * 0.85;
+                ey := by + sin(ang2) * r * 0.55;
+                mx := (ax + ex) * 0.5 + sin(arc_phase * 3.1) * r * 0.20;
+                my := (ay + ey) * 0.5 + cos(arc_phase * 2.7) * r * 0.20;
+                draw_line(ax, ay, mx, my, col(1, 0.95, 1.0, 0.85), 1.5);
+                draw_line(mx, my, ex, ey, col(1, 0.95, 1.0, 0.85), 1.5);
+            }
         }
     }
 
-    // Fuse — wire + spark
-    fuse_wob := sin(cast(float)frame_count / 5.0) * 3;
-    fuse_top_y := by - r - 8 + fuse_wob;
-    fuse_mid_x := bx + sin(cast(float)frame_count / 7.0) * 2.5;
-    fuse_mid_y := by - r - 2 + fuse_wob * 0.5;
-    draw_line(bx, by - r + 0.5, fuse_mid_x, fuse_mid_y, col(0.34, 0.18, 0.45, 1), 2.2);
-    draw_line(fuse_mid_x, fuse_mid_y, fuse_mid_x + 1.5, fuse_top_y, col(0.34, 0.18, 0.45, 1), 2.2);
+    // Orbiting glints — 3 motes circling the equator (depth-faded).
+    for i: 0..2 {
+        ang := cast(float)frame_count / (16.0 - danger * 8.0) + cast(float)i * (TAU / 3.0);
+        ox := cos(ang) * (r + 5);
+        oy := sin(ang) * (r + 5) * 0.55;
+        depth := sin(ang) * 0.5 + 0.5;
+        a := 0.35 + depth * 0.55;
+        sz := 1.4 + depth * 1.6;
+        draw_filled_circle(bx + ox, by + oy, sz * 2.0, col(0.85, 0.55, 1.0, a * 0.30), 8);
+        draw_filled_circle(bx + ox, by + oy, sz,       col(1.0, 0.92, 1.0, a),        6);
+    }
 
-    spark_x := fuse_mid_x + 1.5;
-    spark_y := fuse_top_y;
-    spark_size := 3.0 + sin(cast(float)frame_count / 2.0) * 0.9 + danger * 1.4;
-    spark_c    := mix4(col(1.0, 0.86, 0.32, 1), col(1.0, 0.42, 0.32, 1), danger);
-    // outer glow
-    draw_filled_circle(spark_x, spark_y, spark_size * 2.2, col(spark_c.x, spark_c.y, spark_c.z, 0.30), 10);
-    draw_filled_circle(spark_x, spark_y, spark_size * 1.4, col(spark_c.x, spark_c.y, spark_c.z, 0.65), 8);
-    draw_filled_circle(spark_x, spark_y, spark_size,        spark_c, 8);
-    draw_filled_circle(spark_x, spark_y, spark_size * 0.5,  col(1, 1, 1, 1), 6);
+    // Floating runic crystal (replaces the fuse) — a small diamond hovering
+    // over the orb with a wisp of mana drawn down into it.
+    cr_bob := sin(cast(float)frame_count / 14.0) * 1.2;
+    crystal_y := by - r - 9 + cr_bob;
+    cs := 3.6 + danger * 1.4 + sin(cast(float)frame_count / 5.0) * 0.4;
+    crystal_c := mix4(col(0.85, 0.65, 1.0, 1), col(1.0, 0.55, 0.78, 1), danger);
+    draw_filled_circle(bx, crystal_y, cs * 3.2, col(crystal_c.x, crystal_c.y, crystal_c.z, 0.22), 12);
+    draw_filled_circle(bx, crystal_y, cs * 1.7, col(crystal_c.x, crystal_c.y, crystal_c.z, 0.55), 10);
+    // Diamond: top half light, bottom half tinted.
+    draw_triangle(bx, crystal_y - cs, bx - cs * 0.7, crystal_y, bx + cs * 0.7, crystal_y, col(1, 0.94, 1, 0.95));
+    draw_triangle(bx, crystal_y + cs, bx - cs * 0.7, crystal_y, bx + cs * 0.7, crystal_y, crystal_c);
+    draw_filled_circle(bx, crystal_y, cs * 0.35, col(1, 1, 1, 1), 6);
 
-    // Tiny dancing sparks
-    for i: 0..3 {
-        t := cast(float)(frame_count + i * 9 + cast(int)(bx * 0.3)) / 5.0;
-        ox := cos(t + cast(float)i) * (4.5 + cast(float)i);
-        oy := sin(t * 1.3 + cast(float)i) * 3.0 - 2.0;
-        a  := 0.7 - cast(float)i * 0.15;
-        if a > 0 {
-            draw_filled_circle(spark_x + ox, spark_y + oy, 0.9 + danger * 0.4, col(1, 0.88, 0.50, a), 4);
-        }
+    // Wisp connecting the crystal down into the orb.
+    for i: 0..2 {
+        t := cast(float)i / 2.0;
+        wob := sin(cast(float)frame_count / 4.0 + t * 3.0) * 1.4 * (1.0 - t);
+        wx := bx + wob;
+        wy := (crystal_y + cs) * (1.0 - t) + (by - r + 0.5) * t;
+        a := 0.55 * (1.0 - t * 0.5);
+        draw_filled_circle(wx, wy, 1.0 + (1.0 - t) * 0.6, col(crystal_c.x, crystal_c.y, crystal_c.z, a), 6);
+    }
+
+    // Rising mana motes — drift up from the orb like incense, fade out.
+    motes :: 5;
+    period :: 60.0;
+    for i: 0..motes-1 {
+        slot := (frame_count + i * 13 + b.x * 11 + b.y * 7) % cast(int) period;
+        phase := cast(float)slot / period;
+        mx := bx + sin(phase * TAU * 2.0 + cast(float)i + seed * 0.01) * 4.5;
+        my := by - r - 4 - phase * 22;
+        a := (1.0 - phase) * 0.65;
+        sz := 1.0 + (1.0 - phase) * 0.8;
+        mc := mix4(col(0.75, 0.55, 1.0, 1), col(1.0, 0.78, 1.0, 1), danger);
+        draw_filled_circle(mx, my, sz * 1.8, col(mc.x, mc.y, mc.z, a * 0.30), 6);
+        draw_filled_circle(mx, my, sz,       col(mc.x, mc.y, mc.z, a),        5);
     }
 }
 
@@ -2612,12 +2712,12 @@ draw_explosion :: (e: Explosion, ex: float, ey: float) {
     alpha    := min(1.0, cast(float)e.timer / cast(float)e.duration + 0.2);
     size     := cast(float)TILE - 4 + sin(progress * PI) * 10;
 
-    // Wide halo (bloom-ish)
-    halo_a := inv * 0.55;
-    draw_filled_circle(ex, ey, size * 0.95, col(1.0, 0.65, 0.96, halo_a * 0.35), 22);
-    draw_filled_circle(ex, ey, size * 0.72, col(0.95, 0.75, 1.0, halo_a * 0.55), 22);
-
     if e.origin {
+        // Wide round bloom for the origin tile (the mana burst).
+        halo_a := inv * 0.55;
+        draw_filled_circle(ex, ey, size * 0.95, col(1.0, 0.65, 0.96, halo_a * 0.35), 22);
+        draw_filled_circle(ex, ey, size * 0.72, col(0.95, 0.75, 1.0, halo_a * 0.55), 22);
+
         // Bright central flash for the first ~third of life
         flash := max(0.0, (0.45 - progress) / 0.45);
         if flash > 0 {
@@ -2667,21 +2767,102 @@ draw_explosion :: (e: Explosion, ex: float, ey: float) {
             }
         }
     } else {
-        // Branch arms — swirly flames
-        seg :: 14;
-        for i: 0..seg-1 {
-            t := cast(float)i / cast(float)seg;
-            ang := t * TAU + progress * 1.4;
-            r := size * 0.50 * (0.6 + sin(t * PI + progress * 3.0) * 0.30);
-            fx_x := ex + cos(ang) * r;
-            fx_y := ey + sin(ang) * r * 0.8;
-            draw_filled_circle(fx_x, fx_y, 2.6 + inv * 1.6, col(1.0, 0.68, 0.96, alpha * inv * 0.85), 6);
+        draw_arm_flow(e, progress, inv, alpha);
+    }
+}
+
+// Directional mana stream for one arm tile. Renders a capsule of layered
+// circles along (dx,dy) from the inner edge to the outer edge; the outer end
+// rounds off only when this tile is the arm's tip. Animated bubbles slide
+// outward to sell the "flow" read.
+draw_arm_flow :: (e: Explosion, progress: float, inv: float, alpha: float) {
+    height :: 0.35;
+    cx_w := cast(float)(e.x * TILE) + cast(float)TILE * 0.5;
+    cz_w := cast(float)(e.y * TILE) + cast(float)TILE * 0.5;
+    half := cast(float)TILE * 0.5;
+
+    // Project the inner and outer midpoints of this tile, plus a tip-cap
+    // anchor one half-width beyond the outer edge for capping.
+    inner_sc, _ := project(.{cx_w - cast(float)e.dx * half, cast(float)TILE * height, cz_w - cast(float)e.dy * half});
+    outer_sc, _ := project(.{cx_w + cast(float)e.dx * half, cast(float)TILE * height, cz_w + cast(float)e.dy * half});
+
+    fx := outer_sc.x - inner_sc.x;
+    fy := outer_sc.y - inner_sc.y;
+    flen := sqrt(fx * fx + fy * fy);
+    if flen < 0.5 return;
+    ux := fx / flen; uy := fy / flen;       // flow unit vector
+    px := -uy;       py := ux;              // perpendicular
+
+    seed := cast(float)(e.x * 13 + e.y * 27);
+    pump := 1.0 + sin(progress * PI) * 0.10;
+    half_w := flen * 0.30 * pump;           // stream half-width
+
+    body_a := alpha * (0.65 + 0.35 * inv);
+
+    // Soft underglow stretched along the stream.
+    halo_steps :: 8;
+    for i: 0..halo_steps-1 {
+        t := cast(float)i / cast(float)(halo_steps - 1);
+        cx := inner_sc.x + ux * flen * t;
+        cy := inner_sc.y + uy * flen * t;
+        r := half_w * 1.7;
+        if e.is_tip && t > 0.75 {
+            tt := (t - 0.75) / 0.25;
+            r *= (1.0 - tt * 0.7);
         }
-        // Core
-        draw_filled_circle(ex, ey, size * 0.55, col(0.486, 0.302, 1.0, alpha),       18);
-        draw_filled_circle(ex, ey, size * 0.40, col(0.736, 0.564, 1.0, alpha),       16);
-        draw_filled_circle(ex, ey, size * 0.26, col(0.946, 0.790, 1.0, alpha),       14);
-        draw_filled_circle(ex, ey, size * 0.12, col(1, 1, 1, alpha), 10);
+        draw_filled_circle(cx, cy, r, col(1.0, 0.55, 1.0, inv * 0.30), 12);
+    }
+
+    // Main stream body: layered circles marching outward. Three colour rings
+    // (deep violet rim → bright violet → near-white core) sell the "lit mana
+    // channel" read; the tip tapers via a half-circle width profile.
+    steps :: 14;
+    for i: 0..steps-1 {
+        t := cast(float)i / cast(float)(steps - 1);
+        cx := inner_sc.x + ux * flen * t;
+        cy := inner_sc.y + uy * flen * t;
+
+        // A small sideways waver makes the stream feel alive.
+        wave := sin(t * 6.0 + cast(float)frame_count / 4.0 + seed * 0.03) * half_w * 0.08;
+        cx += px * wave;
+        cy += py * wave;
+
+        w := half_w;
+        if e.is_tip && t > 0.75 {
+            tt := (t - 0.75) / 0.25;
+            // Half-circle taper → rounded cap.
+            w *= sqrt(max(0.0, 1.0 - tt * tt));
+        }
+
+        draw_filled_circle(cx, cy, w * 1.10, col(0.55, 0.30, 1.00, body_a * 0.65), 14);
+        draw_filled_circle(cx, cy, w * 0.85, col(0.85, 0.60, 1.00, body_a * 0.85), 14);
+        draw_filled_circle(cx, cy, w * 0.55, col(1.00, 0.92, 1.00, body_a),        12);
+    }
+
+    // Rounded tip highlight — adds a clean magical "bead" at the arm's end.
+    if e.is_tip {
+        tip_cx := outer_sc.x - ux * half_w * 0.5;
+        tip_cy := outer_sc.y - uy * half_w * 0.5;
+        cap_a := body_a * (0.65 + 0.35 * inv);
+        draw_filled_circle(tip_cx, tip_cy, half_w * 1.45, col(0.55, 0.30, 1.00, cap_a * 0.35), 14);
+        draw_filled_circle(tip_cx, tip_cy, half_w * 0.90, col(0.95, 0.70, 1.00, cap_a * 0.75), 14);
+        draw_filled_circle(tip_cx, tip_cy, half_w * 0.45, col(1.00, 0.98, 1.00, cap_a),        12);
+    }
+
+    // Flowing mana bubbles: sparkles travelling outward from inner to outer
+    // edge in staggered phase.
+    bubbles :: 4;
+    period :: 16;
+    for i: 0..bubbles-1 {
+        slot := (frame_count + i * (period / bubbles) + cast(int)seed) % period;
+        bp := cast(float)slot / cast(float)period;
+        // Clip past the tip cap.
+        if e.is_tip && bp > 0.92 continue;
+        cx := inner_sc.x + ux * flen * bp + px * sin(bp * 6.0 + seed) * half_w * 0.18;
+        cy := inner_sc.y + uy * flen * bp + py * sin(bp * 6.0 + seed) * half_w * 0.18;
+        sz := 1.6 + (1.0 - bp) * 0.7;
+        draw_filled_circle(cx, cy, sz * 1.8, col(1.0, 0.78, 1.0, body_a * 0.45), 8);
+        draw_filled_circle(cx, cy, sz,       col(1.0, 0.98, 1.0, body_a),        6);
     }
 }
 
@@ -3882,6 +4063,7 @@ tick_pirate :: () {
             cn.cooldown_timer = CANNON_COOLDOWN_TICKS;
             cn.flash_timer    = CANNON_FIRE_FLASH_TICKS;
             dx, dy := dir_offset(cn.dir);
+            last_idx := -1;
             for k: 1..CANNON_RANGE {
                 nx := cn.x + dx * k;
                 ny := cn.y + dy * k;
@@ -3895,13 +4077,18 @@ tick_pirate :: () {
                     spawn_death_fx(cast(float)nx, cast(float)ny, current_theme.melt_top, false);
                     ne: Explosion;
                     ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                    ne.dx = dx; ne.dy = dy;
                     array_add(*explosions_list, ne);
+                    last_idx = explosions_list.count - 1;
                     break;
                 }
                 ne: Explosion;
                 ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                ne.dx = dx; ne.dy = dy;
                 array_add(*explosions_list, ne);
+                last_idx = explosions_list.count - 1;
             }
+            if last_idx >= 0 explosions_list[last_idx].is_tip = true;
             add_shake(SHAKE_PER_CHAIN);
             recent_boom = 1.0;
         }
@@ -4471,6 +4658,7 @@ explode :: (b: Bomb) {
     for dir_idx: 0..3 {
         dx := DIRS[dir_idx * 2];
         dy := DIRS[dir_idx * 2 + 1];
+        last_idx := -1;
         for i: 1..b.range {
             nx := b.x + dx * i;
             ny := b.y + dy * i;
@@ -4504,7 +4692,9 @@ explode :: (b: Bomb) {
                 array_unordered_remove_by_index(*powerups, hit_powerup_idx);
                 ne: Explosion;
                 ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                ne.dx = dx; ne.dy = dy;
                 array_add(*explosions_list, ne);
+                last_idx = explosions_list.count - 1;
                 break;
             }
 
@@ -4549,14 +4739,19 @@ explode :: (b: Bomb) {
 
                 ne: Explosion;
                 ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+                ne.dx = dx; ne.dy = dy;
                 array_add(*explosions_list, ne);
+                last_idx = explosions_list.count - 1;
                 break;
             }
 
             ne: Explosion;
             ne.x = nx; ne.y = ny; ne.timer = EXPLOSION_DURATION; ne.duration = EXPLOSION_DURATION;
+            ne.dx = dx; ne.dy = dy;
             array_add(*explosions_list, ne);
+            last_idx = explosions_list.count - 1;
         }
+        if last_idx >= 0 explosions_list[last_idx].is_tip = true;
     }
 }
 
@@ -5714,6 +5909,9 @@ render :: () {
         draw_filled_circle(sc.x, sc.y, sz * 0.55, col(1, 1, 1, a * 0.85), 6);
     }
 
+    // ── 3D world, depth-sorted ─────────────────────────────────────────────
+    // Queue the floor (+ water) into the 3D list, then flush so it lands on
+    // screen before screen-space floor lights composite on top.
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
             if grid[r][c] == .EMPTY || grid[r][c] == .BRICK_MELTING {
@@ -5723,13 +5921,15 @@ render :: () {
             }
         }
     }
+    flush_draw3d();
 
     // Floor light pools (bombs, powerups, explosions, characters) — drawn over floor, under walls
     draw_floor_lights();
 
-    // Level mechanic ground-pass (e.g. mine cart rails). No-op for vanilla.
+    // Queue the second 3D batch: level ground decoration (rails, deck planks)
+    // and every wall / brick / melting brick. All depth-sort together so the
+    // tall geometry composites correctly even at lower camera pitches.
     if current_mechanic.draw_ground current_mechanic.draw_ground();
-
     for r: 0..ROWS-1 {
         for c: 0..COLS-1 {
             if grid[r][c] == .WALL draw_wall_3d(c, r);
@@ -5743,7 +5943,11 @@ render :: () {
                 }
             }
         }
+    }
+    flush_draw3d();
 
+    // ── 2D billboards, per-row painter's order ────────────────────────────
+    for r: 0..ROWS-1 {
         for powerups {
             if it.delay > 0 || it.y != r continue;
             cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
@@ -5762,7 +5966,9 @@ render :: () {
             if it.punching || it.y != r continue;
             cx_w := cast(float)(it.x * TILE) + cast(float)TILE * 0.5;
             cz_w := cast(float)(it.y * TILE) + cast(float)TILE * 0.5;
-            sc, _ := project(.{cx_w, cast(float)TILE * 0.3, cz_w});
+            // Hover bob — magical levitation, not sitting on the floor.
+            hover := sin(cast(float)frame_count / 14.0 + cast(float)(it.x * 7 + it.y * 11)) * cast(float)TILE * 0.05;
+            sc, _ := project(.{cx_w, cast(float)TILE * 0.42 + hover, cz_w});
             draw_bomb(it, sc.x, sc.y);
         }
 
